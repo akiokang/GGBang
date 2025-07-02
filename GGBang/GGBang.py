@@ -9,11 +9,15 @@ import gc
 from pathlib import Path
 import json
 import random
+import numpy as np
 import re
 import shutil
 import sys
 import subprocess
 import platform
+from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorClip, ImageClip, ImageSequenceClip
+from moviepy.video.fx import all as vfx
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor
 import moviepy.config as cf
 # --- 智能配置 ImageMagick 路径 ---
 # 判断程序是否被 PyInstaller 打包
@@ -36,7 +40,9 @@ else:
 
 # --- AI抠像功能需要的新库 ---
 try:
-    pass
+    import cv2
+    import rembg
+    import onnxruntime as ort
 except ImportError:
     tk_messagebox.showerror("依赖缺失", "AI抠像功能所需的核心库 (cv2, rembg, onnxruntime) 未安装。\n请运行: pip install opencv-python rembg onnxruntime\n如需GPU加速，请额外安装: pip install onnxruntime-gpu")
 
@@ -59,7 +65,6 @@ def get_persistent_settings_path(filename):
     return os.path.join(app_config_dir, filename)
 
 def video_parse_rgba(rgba_string):
-    from PIL import ImageColor
     if isinstance(rgba_string, str) and rgba_string.startswith('rgba'):
         try:
             parts = re.findall(r"[-+]?\d*\.\d+|\d+", rgba_string)
@@ -70,9 +75,6 @@ def video_parse_rgba(rgba_string):
     except ValueError: return (0,0,0), 0.5
 
 def video_create_text_overlay(text, shared_style, specific_config, video_size):
-    from moviepy.editor import TextClip, ColorClip, CompositeVideoClip
-    from PIL import Image, ImageDraw
-    import numpy as np
     video_width, _ = video_size
     colors = specific_config['colors']
     font_file = shared_style['font_file']
@@ -128,7 +130,6 @@ def video_create_text_overlay(text, shared_style, specific_config, video_size):
         if text_clip: text_clip.close()
 
 def image_preprocess(img, config, logger, img_path_for_logging=""):
-    from PIL import Image, ImageOps
     original_width, original_height = img.size
     processed_img = img
     zoom_percentages = config.get("zoom_crop_percentages", [])
@@ -174,7 +175,6 @@ def image_wrap_text(draw, text, font, max_width):
     return lines, max(widths), heights
 
 def image_apply_text(img_path, text, config, pos_tuple, output_path, logger, stop_event):
-    from PIL import Image, ImageDraw, ImageFont 
     if stop_event.is_set(): return 'STOPPED'
     try: base_img = Image.open(img_path).convert("RGB")
     except Exception as e: logger(f"❌ 打开图片失败: {img_path} - {e}"); return False
@@ -227,7 +227,7 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
         self.SETTINGS_FILE = get_persistent_settings_path("gui_settings.json")
         self.video_stop_event, self.image_stop_event, self.ai_matting_stop_event, self.ab_image_stop_event,self.cut_stop_event = threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event()
-        self.video_stop_event, self.image_stop_event, self.ai_matting_stop_event, self.ab_image_stop_event, self.news_stop_event, self.blur_stop_event,self.audio_stop_event,self.freeze_stop_event,self.gs_replace_stop_event,self.lut_stop_event = threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event()  
+        self.video_stop_event, self.image_stop_event, self.ai_matting_stop_event, self.ab_image_stop_event, self.news_stop_event, self.blur_stop_event,self.audio_stop_event,self.freeze_stop_event,self.lut_stop_event , self.composite_stop_event= threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event() , threading.Event()
         self.grid_rowconfigure(0, weight=1)
         self.video_stop_event, self.image_stop_event, self.ai_matting_stop_event, self.ab_image_stop_event, self.news_stop_event = threading.Event(), threading.Event(), threading.Event(), threading.Event(), threading.Event()
         self.grid_columnconfigure(0, weight=1)
@@ -241,11 +241,12 @@ class App(ctk.CTk):
         self.main_tabview.add("视频截图片")
         self.main_tabview.add("NEWS绿幕")
         self.main_tabview.add("NEWS虚化")
-        self.main_tabview.add("绿幕替换")
+        self.main_tabview.add("绿幕合成")
         self.main_tabview.add("定格")
         self.main_tabview.add("卡秒")
         self.main_tabview.add("加滤镜")
         self.main_tabview.add("音频提取")
+        self.setup_greenscreen_composite_workflow()
         self.setup_video_workflow()
         self.setup_image_workflow()
         self.setup_ai_matting_workflow()
@@ -257,7 +258,6 @@ class App(ctk.CTk):
         self.setup_freeze_workflow()
         self.setup_cut_workflow()
         self.setup_news_blur_workflow()
-        self.setup_gs_replace_workflow()
         self.setup_lut_workflow()
         self.hw_info_frame = ctk.CTkFrame(self, height=30, border_width=1)
         self.hw_info_frame.pack(side="bottom", fill="x", padx=10, pady=(0,10))
@@ -267,8 +267,288 @@ class App(ctk.CTk):
         self.gpu_info_label.pack(side="left", padx=10)
         self.is_gpu_available = False
         threading.Thread(target=self._detect_and_display_hardware, daemon=True).start()
+        self.selected_hsv_range = None  # 用于绿幕合成的颜色范围
+        self.cropping_ref_point = []  # 用于绿幕合成的鼠标点
+        self.cropping_active = False  # 用于绿幕合成的鼠标状态
         self.load_settings()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # ==============================================================================
+        # --- 绿幕合成 (新功能整合自 lvmu.py) ---
+        # ==============================================================================
+
+    def setup_greenscreen_composite_workflow(self):
+        """创建“绿幕合成”功能的UI界面，风格统一 (布局最终修正)"""
+        tab = self.main_tabview.tab("绿幕合成")
+
+        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # --- 1. 路径设置 ---
+        path_frame = ctk.CTkFrame(main_frame)
+        path_frame.pack(fill="x", pady=5)
+        # 这个标题标签是path_frame的子控件，使用pack
+        ctk.CTkLabel(path_frame, text="操作步骤", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5,10))
+        # 下面这些控件被封装在自己的框架里，所以不会与上面的标题冲突
+        self.create_folder_selection_row(path_frame, "1. 选择绿幕文件夹:", "选择带绿幕的视频文件夹", "gs_composite_source_folder_entry")
+        self.create_folder_selection_row(path_frame, "2. 选择视频文件夹:", "选择作为背景的视频文件夹", "gs_composite_bg_folder_entry")
+        self.create_folder_selection_row(path_frame, "3. 选择输出文件夹:", "选择处理结果的存放位置", "gs_composite_output_folder_entry")
+
+        # --- 2. 高级设置 (修正核心) ---
+        settings_frame = ctk.CTkFrame(main_frame)
+        settings_frame.pack(fill="x", pady=(15,5), ipady=5)
+        settings_frame.grid_columnconfigure(1, weight=1) # 配置列权重
+
+        # 【修正】标题标签也使用 .grid()，并让它横跨两列
+        ctk.CTkLabel(settings_frame, text="高级设置 (可选)", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(5, 10), sticky="w")
+
+        # 【修正】后续控件的 row 从 1 开始
+        calibrate_button = ctk.CTkButton(settings_frame, text="校准颜色", command=self.composite_calibrate_color)
+        calibrate_button.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+
+        self.composite_color_status_label = ctk.CTkLabel(settings_frame, text="颜色范围: 默认值", text_color="orange")
+        self.composite_color_status_label.grid(row=1, column=1, padx=10, sticky="w")
+
+        self.composite_freeze_switch = ctk.CTkSwitch(settings_frame, text="开启结尾定格")
+        self.composite_freeze_switch.grid(row=2, column=0, padx=10, pady=5, sticky="w")
+
+        freeze_entry_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        freeze_entry_frame.grid(row=2, column=1, sticky="w", padx=10)
+        ctk.CTkLabel(freeze_entry_frame, text="定格时长(秒):").pack(side="left")
+        self.composite_freeze_duration_entry = ctk.CTkEntry(freeze_entry_frame, width=60)
+        self.composite_freeze_duration_entry.insert(0, "3")
+        self.composite_freeze_duration_entry.pack(side="left", padx=5)
+
+        # --- 3. 开始处理与日志 ---
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=(15, 5))
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.composite_start_button = ctk.CTkButton(button_frame, text="开始处理", height=40, command=self.start_composite_processing)
+        self.composite_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.composite_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40, command=self.stop_composite_processing, state="disabled", fg_color="red", hover_color="darkred")
+        self.composite_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        self.composite_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
+        self.composite_log_textbox.pack(expand=True, fill="both", pady=(10,5))
+
+        self.composite_progress_bar = ctk.CTkProgressBar(main_frame, orientation='horizontal', mode='determinate')
+        self.composite_progress_bar.pack(fill="x", pady=(5, 0))
+        self.composite_progress_bar.set(0)
+
+    def log_composite(self, message, clear=False):
+        self.after(0, self._update_log, self.composite_log_textbox, message, clear)
+
+    def _composite_select_color_callback(self, event, x, y, flags, param):
+        """鼠标回调函数，用于处理框选操作 (已整合为类方法)"""
+        frame = param['frame']
+        clone = frame.copy()
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.cropping_ref_point = [(x, y)]
+            self.cropping_active = True
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.cropping_ref_point.append((x, y))
+            self.cropping_active = False
+            cv2.rectangle(clone, self.cropping_ref_point[0], self.cropping_ref_point[1], (0, 255, 0), 2)
+            cv2.imshow("image", clone)
+            if len(self.cropping_ref_point) == 2:
+                x0, y0 = min(self.cropping_ref_point[0][0], self.cropping_ref_point[1][0]), min(
+                    self.cropping_ref_point[0][1], self.cropping_ref_point[1][1])
+                x1, y1 = max(self.cropping_ref_point[0][0], self.cropping_ref_point[1][0]), max(
+                    self.cropping_ref_point[0][1], self.cropping_ref_point[1][1])
+                roi = frame[y0:y1, x0:x1]
+                if roi.size == 0: return
+                hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                avg_h = int(np.mean(hsv_roi[:, :, 0]));
+                avg_s = int(np.mean(hsv_roi[:, :, 1]));
+                avg_v = int(np.mean(hsv_roi[:, :, 2]))
+                self.log_composite(f"框选区域的平均HSV值为: H={avg_h}, S={avg_s}, V={avg_v}")
+                h_tolerance = 10;
+                s_tolerance = 80;
+                v_tolerance = 80
+                lower_bound = np.array(
+                    [max(0, avg_h - h_tolerance), max(40, avg_s - s_tolerance), max(40, avg_v - v_tolerance)])
+                upper_bound = np.array([min(179, avg_h + h_tolerance), 255, 255])
+                self.selected_hsv_range = (lower_bound, upper_bound)
+                self.after(0, self._composite_update_color_status, True)
+                cv2.waitKey(1000)
+                cv2.destroyAllWindows()
+
+    def _composite_get_video_files(self, folder_path):
+        """递归地从文件夹中获取所有支持格式的视频文件路径。"""
+        SUPPORTED_VIDEO_FORMATS = ('.mp4', '.avi', '.mov', '.mkv', '.flv')
+        video_files = []
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                if file.lower().endswith(SUPPORTED_VIDEO_FORMATS):
+                    video_files.append(os.path.join(root, file))
+        return video_files
+
+    def _composite_update_color_status(self, calibrated):
+        if calibrated:
+            self.composite_color_status_label.configure(text="颜色范围: 已自定义", text_color="green")
+        else:
+            self.selected_hsv_range = None
+            self.composite_color_status_label.configure(text="颜色范围: 默认值", text_color="orange")
+
+    def composite_calibrate_color(self):
+        source_folder = self.gs_composite_source_folder_entry.get()
+        if not source_folder:
+            tk_messagebox.showerror("错误", "请先在“步骤1”中选择“原视频文件夹”！")
+            return
+        source_videos = self._composite_get_video_files(source_folder)
+        if not source_videos:
+            tk_messagebox.showerror("错误", "在“原视频文件夹”中找不到任何视频文件用于校准。")
+            return
+
+        video_for_calibration = source_videos[0]
+        tk_messagebox.showinfo("校准提示",
+                               f"将使用以下视频的第一帧进行颜色校准：\n{os.path.basename(video_for_calibration)}")
+        cap = cv2.VideoCapture(video_for_calibration)
+        if not cap.isOpened():
+            tk_messagebox.showerror("错误", "无法打开用于校准的视频文件。")
+            return
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            tk_messagebox.showerror("错误", "无法读取视频的第一帧。")
+            return
+
+        cv2.namedWindow("image")
+        cv2.putText(frame, "Drag a box on the green area, then release. Press 'q' to quit.", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        param = {'frame': frame}
+        cv2.setMouseCallback("image", self._composite_select_color_callback, param)
+        while True:
+            cv2.imshow("image", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q") or cv2.getWindowProperty("image", cv2.WND_PROP_VISIBLE) < 1:
+                break
+        cv2.destroyAllWindows()
+
+    def start_composite_processing(self):
+        self.composite_start_button.configure(state="disabled")
+        self.composite_stop_button.configure(state="normal")
+        self.composite_stop_event.clear()
+        self.log_composite("开始处理...", clear=True)
+        threading.Thread(target=self.run_composite_logic, daemon=True).start()
+
+    def stop_composite_processing(self):
+        self.log_composite("🔴 发送停止信号...请等待当前文件处理完毕。")
+        self.composite_stop_event.set()
+        self.composite_stop_button.configure(state="disabled")
+
+    def _reset_composite_buttons(self):
+        self.composite_start_button.configure(state="normal")
+        self.composite_stop_button.configure(state="disabled")
+
+    def run_composite_logic(self):
+        try:
+            source_folder = self.gs_composite_source_folder_entry.get()
+            bg_folder = self.gs_composite_bg_folder_entry.get()
+            output_folder = self.gs_composite_output_folder_entry.get()
+
+            if not all([source_folder, bg_folder, output_folder]):
+                tk_messagebox.showerror("错误", "所有文件夹路径都必须选择！")
+                return
+
+            source_videos = self._composite_get_video_files(source_folder)
+            background_videos = self._composite_get_video_files(bg_folder)
+
+            if not source_videos: tk_messagebox.showwarning("警告",
+                                                            "在指定的原视频文件夹中没有找到任何视频文件。"); return
+            if not background_videos: tk_messagebox.showwarning("警告",
+                                                                "在指定的绿幕素材文件夹中没有找到任何视频文件。"); return
+
+            lower_green, upper_green = self.selected_hsv_range if self.selected_hsv_range else (np.array([35, 43, 46]),
+                                                                                                np.array(
+                                                                                                    [77, 255, 255]))
+
+            total_operations = len(source_videos) * len(background_videos)
+            self.composite_progress_bar.configure(
+                determinate_speed=50 / total_operations if total_operations > 0 else 0)
+            completed_operations = 0
+
+            for bg_video_path in background_videos:
+                if self.composite_stop_event.is_set(): break
+                for source_video_path in source_videos:
+                    if self.composite_stop_event.is_set(): break
+
+                    op_text = f"{os.path.basename(source_video_path)} + {os.path.basename(bg_video_path)}"
+                    self.log_composite(f"处理中 ({completed_operations + 1}/{total_operations}): {op_text}")
+
+                    relative_path = os.path.relpath(os.path.dirname(bg_video_path), bg_folder)
+                    output_subfolder = os.path.join(output_folder, relative_path)
+                    os.makedirs(output_subfolder, exist_ok=True)
+
+                    source_basename, bg_basename = os.path.splitext(os.path.basename(source_video_path))[0], \
+                    os.path.splitext(os.path.basename(bg_video_path))[0]
+                    output_filename = f"{source_basename}_on_{bg_basename}.mp4"
+                    output_filepath = os.path.join(output_subfolder, output_filename)
+
+                    source_capture = cv2.VideoCapture(source_video_path)
+                    bg_capture = cv2.VideoCapture(bg_video_path)
+                    if not source_capture.isOpened() or not bg_capture.isOpened(): continue
+
+                    width, height = int(source_capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(
+                        source_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    fps = source_capture.get(cv2.CAP_PROP_FPS) or 30
+                    out = cv2.VideoWriter(output_filepath, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                    last_combined_frame = None
+
+                    while True:
+                        if self.composite_stop_event.is_set(): break
+                        source_ret, source_frame = source_capture.read()
+                        if not source_ret: break
+                        bg_ret, bg_frame = bg_capture.read()
+                        if not bg_ret:
+                            bg_capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            bg_ret, bg_frame = bg_capture.read()
+                            if not bg_ret: break
+
+                        bg_frame_resized = cv2.resize(bg_frame, (width, height))
+                        hsv = cv2.cvtColor(source_frame, cv2.COLOR_BGR2HSV)
+                        mask = cv2.inRange(hsv, lower_green, upper_green)
+                        kernel = np.ones((5, 5), np.uint8)
+                        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+                        mask_inv = cv2.bitwise_not(mask)
+                        foreground = cv2.bitwise_and(source_frame, source_frame, mask=mask_inv)
+                        background = cv2.bitwise_and(bg_frame_resized, bg_frame_resized, mask=mask)
+                        combined_frame = cv2.add(foreground, background)
+                        last_combined_frame = combined_frame
+                        out.write(combined_frame)
+
+                    if self.composite_freeze_switch.get() and last_combined_frame is not None:
+                        try:
+                            duration = float(self.composite_freeze_duration_entry.get())
+                            if duration > 0:
+                                num_freeze_frames = int(fps * duration)
+                                self.log_composite(f"  -> 添加 {duration}秒 定格...")
+                                for _ in range(num_freeze_frames):
+                                    out.write(last_combined_frame)
+                        except ValueError:
+                            self.log_composite(f"  -> 无效的定格时长，已跳过。")
+
+                    source_capture.release();
+                    bg_capture.release();
+                    out.release()
+                    completed_operations += 1
+                    self.after(0, self.composite_progress_bar.set, completed_operations / total_operations)
+
+            if not self.composite_stop_event.is_set():
+                self.log_composite(f"处理完成！共生成 {completed_operations} 个文件。")
+                tk_messagebox.showinfo("成功",
+                                       f"所有视频处理完成！\n共生成 {completed_operations} 个文件，已保存到: {output_folder}")
+            else:
+                self.log_composite("任务已中止。")
+
+        except Exception as e:
+            self.log_composite(f"发生未预料的严重错误: {e}")
+            tk_messagebox.showerror("发生错误", f"处理过程中出现错误: {e}")
+        finally:
+            self.after(0, self._reset_composite_buttons)
+            self.after(0, self.composite_progress_bar.set, 0)
+            self.after(0, self.log_composite, "请按步骤选择并开始处理")
     # ==============================================================================
     # --- 加滤镜 (新功能) ---
     # ==============================================================================
@@ -499,10 +779,10 @@ class App(ctk.CTk):
         ctk.CTkLabel(scrollable_frame, text="2. 功能开关", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(20,5))
         switches_frame = ctk.CTkFrame(scrollable_frame, fg_color="transparent")
         switches_frame.pack(fill="x", padx=10, pady=5)
-        
+
         self.gs_replace_random_concat_switch = ctk.CTkSwitch(switches_frame, text="以绿幕时长为准，随机拼接背景视频")
         self.gs_replace_random_concat_switch.pack(anchor="w", pady=5)
-        
+
         self.gs_replace_audio_switch = ctk.CTkSwitch(switches_frame, text="以绿幕视频的音频为主")
         self.gs_replace_audio_switch.pack(anchor="w", pady=5)
         self.gs_replace_audio_switch.select() # 默认开启
@@ -511,14 +791,14 @@ class App(ctk.CTk):
         run_frame = ctk.CTkFrame(scrollable_frame)
         run_frame.pack(fill="x", padx=10, pady=(20, 10))
         ctk.CTkLabel(run_frame, text="3. 开始处理", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
-        
+
         button_frame = ctk.CTkFrame(run_frame, fg_color="transparent")
         button_frame.pack(fill="x", pady=10)
         button_frame.grid_columnconfigure((0, 1), weight=1)
 
         self.gs_replace_start_button = ctk.CTkButton(button_frame, text="开始批量替换", height=40, command=self.start_gs_replace_processing)
         self.gs_replace_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        
+
         self.gs_replace_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40, command=self.stop_gs_replace_processing, state="disabled", fg_color="red", hover_color="darkred")
         self.gs_replace_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
 
@@ -564,12 +844,12 @@ class App(ctk.CTk):
             if not bg_videos or not gs_videos:
                 self.log_gs_replace("❌ 错误: 背景视频文件夹或绿幕视频文件夹中没有找到视频文件。")
                 return
-            
+
             self.log_gs_replace(f"🔍 找到 {len(bg_videos)} 个背景视频和 {len(gs_videos)} 个绿幕视频。")
-            
+
             is_random_concat = self.gs_replace_random_concat_switch.get() == 1
             use_gs_audio = self.gs_replace_audio_switch.get() == 1
-            
+
             if is_random_concat:
                 self.log_gs_replace("▶️ 已选择【随机拼接】模式。")
                 # 随机拼接模式
@@ -596,7 +876,7 @@ class App(ctk.CTk):
                     self.log_gs_replace(f"  绿幕: {os.path.basename(gs_video_path)}")
                     output_path = os.path.join(output_dir, f"processed_{os.path.basename(gs_video_path)}")
                     self._gs_replace_worker(bg_video_path, gs_video_path, output_path, use_gs_audio)
-            
+
             if not self.gs_replace_stop_event.is_set():
                 self.log_gs_replace("\n🎉 所有任务处理完毕！")
             else:
@@ -608,25 +888,23 @@ class App(ctk.CTk):
             self.after(0, self._reset_gs_replace_buttons)
 
     def _gs_replace_worker(self, bg_path, gs_path, output_path, use_gs_audio, bg_clip_obj=None):
-        from moviepy.editor import VideoFileClip, CompositeVideoClip
-        from moviepy.video.fx import all as vfx
         """核心处理单个视频对的函数"""
         bg_clip, gs_clip, final_clip = None, None, None
         try:
             gs_clip = VideoFileClip(gs_path)
             # 如果没有传入背景剪辑对象，则从路径加载
             bg_clip = bg_clip_obj if bg_clip_obj else VideoFileClip(bg_path)
-            
+
             # 统一视频尺寸为背景视频的尺寸
             target_size = bg_clip.size
             gs_clip_resized = gs_clip.resize(target_size)
 
             # MoviePy的chromakey效果，颜色阈值为180，模糊半径为0.02（相对值）
             keyed_gs_clip = gs_clip_resized.fx(vfx.mask_color, color=[0, 255, 0], thr=180, s=0.02)
-            
+
             # 将抠像后的绿幕视频置于背景之上
             final_clip = CompositeVideoClip([bg_clip, keyed_gs_clip.set_position("center")])
-            
+
             # 根据开关决定使用哪个音频
             if use_gs_audio:
                 final_clip.audio = gs_clip.audio
@@ -637,7 +915,7 @@ class App(ctk.CTk):
 
             # 最终视频时长以绿幕视频为准
             final_clip = final_clip.set_duration(gs_clip.duration)
-            
+
             final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
             self.log_gs_replace(f"  ✅ 成功合成视频: {os.path.basename(output_path)}")
 
@@ -648,48 +926,8 @@ class App(ctk.CTk):
             if gs_clip: gs_clip.close()
             if bg_clip: bg_clip.close()
             if final_clip: final_clip.close()
-    
-    def _gs_replace_random_worker(self, bg_video_paths, gs_video_path, output_path, use_gs_audio):
-        from moviepy.editor import VideoFileClip, concatenate_videoclips 
-        """处理随机拼接模式下的单个绿幕视频"""
-        gs_clip_info, concatenated_bg = None, None
-        try:
-            gs_clip_info = VideoFileClip(gs_video_path)
-            target_duration = gs_clip_info.duration
-            self.log_gs_replace(f"  -> 绿幕视频时长为 {target_duration:.2f} 秒，开始拼接背景...")
 
-            clips_to_concat = []
-            current_duration = 0
-            
-            # 随机打乱背景视频列表
-            random.shuffle(bg_video_paths)
-            
-            # 循环拼接直到时长足够
-            while current_duration < target_duration:
-                for path in bg_video_paths:
-                    if current_duration >= target_duration: break
-                    try:
-                        clip = VideoFileClip(path)
-                        clips_to_concat.append(clip)
-                        current_duration += clip.duration
-                    except Exception:
-                        self.log_gs_replace(f"  -> 警告: 加载背景视频 {os.path.basename(path)} 失败，跳过。")
-            
-            if not clips_to_concat:
-                 self.log_gs_replace("  ❌ 无法加载任何背景视频来拼接。")
-                 return
-            
-            # 合成一个长的背景视频
-            concatenated_bg = concatenate_videoclips(clips_to_concat)
-            self.log_gs_replace(f"  -> 背景拼接完成，总时长 {concatenated_bg.duration:.2f} 秒。")
 
-            # 调用核心worker进行处理，直接传入拼接好的背景剪辑对象
-            self._gs_replace_worker(None, gs_video_path, output_path, use_gs_audio, bg_clip_obj=concatenated_bg)
-
-        finally:
-            # 确保关闭所有临时剪辑
-            if gs_clip_info: gs_clip_info.close()
-            if concatenated_bg: concatenated_bg.close()
     # ==============================================================================
     # --- 定格 (新功能) ---
     # ==============================================================================
@@ -1326,8 +1564,6 @@ class App(ctk.CTk):
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if ret else None
 
     def _blur_create_text_image(self, text, box_w, box_h, font_path, font_color, bg_color, corner_radius):
-        from PIL import Image, ImageDraw, ImageFont, ImageColor
-        import numpy as np
         """
         (新版) 创建带自适应换行和字体缩放的文本图片。
         - 能够处理不含空格的长字符串。
@@ -1426,8 +1662,6 @@ class App(ctk.CTk):
         return np.array(bg_image)
 
     def _blur_process_video(self, input_path, output_path, use_gpu, content_roi, pip_roi, text_config, offsets):
-        from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
-        import cv2
         # This is process_video_file, adapted as a class method.
         final_clip, original_clip = None, None
         try:
@@ -2308,8 +2542,6 @@ class App(ctk.CTk):
         self.stop_ai_matting_button.configure(state="disabled")
 
     def run_ai_matting_logic(self):
-        import rembg
-        import onnxruntime as ort
         try:
             video_dir = self.ai_video_folder_entry.get()
             bg_dir = self.ai_bg_folder_entry.get()
@@ -2390,11 +2622,6 @@ class App(ctk.CTk):
             self.after(0, self._reset_ai_matting_buttons)
 
     def _ai_matting_worker(self, input_path, output_path, session, background_path=None):
-        from moviepy.editor import VideoFileClip, ImageSequenceClip
-        from PIL import Image
-        import cv2
-        import rembg
-        import numpy as np
         self.log_ai_matting(f"-> 正在处理视频: {os.path.basename(input_path)}")
         if background_path:
             self.log_ai_matting(f"-> 使用背景图片: {os.path.basename(background_path)}")
@@ -3357,10 +3584,6 @@ class App(ctk.CTk):
             },
             'freeze_settings': {
                 'duration': self.freeze_duration_entry.get()
-            },
-            'gs_replace_settings': {
-                'random_concat': self.gs_replace_random_concat_switch.get(),
-                'use_gs_audio': self.gs_replace_audio_switch.get()
             }
         }
         try:
@@ -3484,11 +3707,7 @@ class App(ctk.CTk):
         self.freeze_duration_entry.delete(0, 'end')
         self.freeze_duration_entry.insert(0, freeze_s.get('duration', '3'))
         # 加载绿幕替换设置
-        gs_s = settings.get('gs_replace_settings', {})
-        if gs_s.get('random_concat', 0): self.gs_replace_random_concat_switch.select()
-        else: self.gs_replace_random_concat_switch.deselect()
-        if gs_s.get('use_gs_audio', 1): self.gs_replace_audio_switch.select()
-        else: self.gs_replace_audio_switch.deselect()
+
             
     def _update_color_widget(self, attr_name, color_value): setattr(self, attr_name + "_value", color_value); button = getattr(self, attr_name + "_button"); button.configure(text=str(color_value), fg_color="gray" if "rgba" in str(color_value) else color_value)
 
