@@ -2740,12 +2740,66 @@ class App(ctk.CTk):
         self.start_video_button.configure(state="normal")
         self.stop_video_button.configure(state="disabled")
 
+    def _preprocess_video_orientation(self, input_path, temp_dir, logger):
+        """
+        【最终可靠版】不再检测元数据，直接对所有.MOV文件执行修正。
+        """
+        # 检查文件扩展名，只对 .mov 文件进行处理
+        if input_path.lower().endswith('.mov'):
+            logger("\n--- [视频预处理] ---")
+            logger(f"  - [规则] 检测到.MOV文件，将强制执行方向修正...")
+
+            try:
+                # 查找ffmpeg路径
+                ffmpeg_path = self._find_executable("ffmpeg")
+                if not ffmpeg_path:
+                    logger("  ❌ [致命错误] 找不到ffmpeg.exe，无法修正MOV文件。")
+                    return None, None
+
+                # 定义临时输出路径
+                temp_output_path = os.path.join(temp_dir, f"corrected_{os.path.basename(input_path)}.mp4")
+
+                # 构建您已验证成功的、最可靠的ffmpeg命令
+                command = [
+                    ffmpeg_path,
+                    "-y",
+                    "-i", input_path,
+                    "-metadata:s:v:0", "rotate=0",
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-c:a", "copy",
+                    temp_output_path
+                ]
+
+                # 执行命令
+                logger(f"  - [操作] 正在执行FFmpeg修正命令...")
+                creation_flags = 0
+                if sys.platform == 'win32':
+                    # 如果是Windows，则使用“无窗口”标志
+                    creation_flags = subprocess.CREATE_NO_WINDOW
+                subprocess.run(command, shell=True, check=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=creation_flags)
+                logger("  - ✅ 修正成功，后续将使用此临时文件。")
+
+                # 返回新生成的临时文件路径
+                return temp_output_path, temp_output_path
+
+            except Exception as e:
+                logger(f"  ❌ [致命错误] MOV文件修正过程中发生错误: {e}")
+                if hasattr(e, 'stderr') and e.stderr:
+                    logger(f"  - [FFmpeg错误日志]: {e.stderr.decode('utf-8', errors='ignore').strip()}")
+                return None, None  # 修正失败
+
+        else:
+            # 如果不是.MOV文件，则假定其方向正常，直接跳过
+            return input_path, None
     def run_video_logic(self):
         try:
             video_folder = self.video_folder_entry.get()
             output_folder = self.video_output_folder_entry.get()
             config = self.get_video_config_from_gui()
-            all_input_text = self.video_text_input_box.get("1.0","end-1c")
+            all_input_text = self.video_text_input_box.get("1.0", "end-1c")
             use_gpu = self.video_use_gpu_switch.get() == 1
 
             try:
@@ -2754,35 +2808,28 @@ class App(ctk.CTk):
             except (ValueError, AssertionError):
                 self.log_video("错误: '生成组数' 必须是一个有效的正整数。")
                 return
-                
             if not all([video_folder, output_folder, config, all_input_text.strip()]):
                 self.log_video("错误: 缺少视频/输出文件夹、配置或文案信息。")
                 return
-
             text_lines = [line.strip() for line in all_input_text.splitlines() if line.strip()]
             if not text_lines:
-                 self.log_video("错误: 文案信息不能为空。")
-                 return
-                 
+                self.log_video("错误: 文案信息不能为空。")
+                return
             num_texts_per_group = len(text_lines)
             total_videos_needed = num_texts_per_group * num_groups
-            
-            all_available_videos = [f for f in os.listdir(video_folder) if f.lower().endswith(('.mp4','.mov','.avi'))]
+            all_available_videos = [f for f in os.listdir(video_folder) if f.lower().endswith(('.mp4', '.mov', '.avi'))]
             if len(all_available_videos) < total_videos_needed:
                 self.log_video(f"错误: 视频不足！需要 {total_videos_needed} 个, 但只有 {len(all_available_videos)} 个。")
                 return
-            
             random.shuffle(all_available_videos)
             videos_to_process = all_available_videos[:total_videos_needed]
-            
             if os.path.exists(output_folder):
-                self.log_video(f"清空旧的结果文件夹: '{output_folder}'...")
                 shutil.rmtree(output_folder)
             os.makedirs(output_folder)
             self.log_video(f"已创建新的空结果文件夹: '{output_folder}'")
             self.log_video(f"准备就绪: 将处理 {total_videos_needed} 个视频, 分成 {num_groups} 组。")
             self.log_video("!!! 警告：处理成功后，原始视频将被删除以防重复。请确保您有备份。 !!!")
-            
+
             shared_style_config = config['shared_style']
             group_count = 0
             for i in range(0, len(videos_to_process), num_texts_per_group):
@@ -2790,115 +2837,114 @@ class App(ctk.CTk):
                     self.log_video("🔴 任务已中止。")
                     break
                 group_count += 1
-                video_chunk = videos_to_process[i:i+num_texts_per_group]
+                video_chunk = videos_to_process[i:i + num_texts_per_group]
                 group_folder = os.path.join(output_folder, f"group_{group_count}")
                 os.makedirs(group_folder, exist_ok=True)
                 self.log_video(f"\n---=== 开始处理第 {group_count} 组 ===---")
-                
+
                 for j, video_name in enumerate(video_chunk):
                     if self.video_stop_event.is_set():
                         self.log_video("🔴 任务在组内中止。")
                         break
-                    if j >= len(text_lines):
-                        break
-                        
+
                     input_video_path = os.path.join(video_folder, video_name)
                     output_video_path = os.path.join(group_folder, f"processed_{video_name}")
                     text_line = text_lines[j]
-                    
-                    self.log_video(f"\n[{j+1}/{len(video_chunk)}] 正在处理...")
+
+                    self.log_video(f"\n[{j + 1}/{len(video_chunk)}] 正在处理...")
                     self.log_video(f"  - 视频: {video_name}")
-                    
+
+                    temp_file_to_delete = None
+
                     try:
+                        # 调用预处理方法
+                        corrected_video_path, temp_file_to_delete = self._preprocess_video_orientation(
+                            input_video_path, group_folder, self.log_video
+                        )
+
+                        # 如果预处理失败，则跳过这个视频
+                        if not corrected_video_path:
+                            self.log_video(f"  -> 预处理失败，跳过视频: {video_name}")
+                            continue
+
+                        # MoviePy 加载的是已经100%正确的视频文件
+                        video_clip = VideoFileClip(corrected_video_path)
+
                         text_parts = [part.strip() for part in text_line.split('&')]
                         self.log_video(f"  - 文案被分割为 {len(text_parts)} 部分: {text_parts}")
-                        if self.video_stop_event.is_set():
-                            break
-                        
-                        video_clip = VideoFileClip(input_video_path)
+
                         overlays = []
-                        
                         main_text_config = config['main_text']
-                        main_overlay = video_create_text_overlay(text_parts[0], shared_style_config, main_text_config, video_clip.size)
+                        main_overlay = video_create_text_overlay(text_parts[0], shared_style_config, main_text_config,
+                                                                 video_clip.size)
                         pos_config = main_text_config['position']
                         x_pos, y_pos = pos_config.get('x', 'center'), pos_config.get('y', 'center')
-                        main_overlay = main_overlay.set_position((x_pos, y_pos) if x_pos != 'center' else ('center', y_pos))
+                        main_overlay = main_overlay.set_position(
+                            (x_pos, y_pos) if x_pos != 'center' else ('center', y_pos))
                         overlays.append(main_overlay)
-                        
+
                         main_y_position = main_overlay.pos(video_clip.size)[1]
                         last_clip_y, last_clip_height = main_y_position, main_overlay.size[1]
-                        
+
                         if len(text_parts) > 1:
                             sub_texts_configs = config.get('sub_texts', [])
                             for k, sub_text in enumerate(text_parts[1:]):
-                                if k >= len(sub_texts_configs):
-                                    self.log_video(f"  - 警告: 第 {k+2} 部分文案没有对应的配置，将被忽略。")
-                                    break
+                                if k >= len(sub_texts_configs): break
                                 sub_text_config = sub_texts_configs[k]
-                                sub_overlay = video_create_text_overlay(sub_text, shared_style_config, sub_text_config, video_clip.size)
+                                sub_overlay = video_create_text_overlay(sub_text, shared_style_config, sub_text_config,
+                                                                        video_clip.size)
                                 y_offset = sub_text_config.get("relative_y_offset", 10)
                                 new_y = last_clip_y + last_clip_height + y_offset
                                 sub_overlay = sub_overlay.set_position(('center', new_y))
                                 overlays.append(sub_overlay)
                                 last_clip_y, last_clip_height = new_y, sub_overlay.size[1]
-                        
+
                         final_clip = CompositeVideoClip([video_clip] + overlays).set_duration(video_clip.duration)
                         gpu_codec, cpu_codec = 'h264_nvenc', 'libx264'
-                        
+
                         if use_gpu and self.is_gpu_available:
                             self.log_video(f"  -> 尝试使用GPU编码 ({gpu_codec})...")
                             try:
-                                final_clip.write_videofile(output_video_path, codec=gpu_codec, audio_codec='aac', threads=4, preset='fast', logger=None)
+                                final_clip.write_videofile(output_video_path, codec=gpu_codec, audio_codec='aac',
+                                                           threads=4, preset='fast', logger=None)
                             except Exception:
                                 self.log_video(f"  -> 警告: GPU编码失败。正在回退到CPU编码。")
-                                final_clip.write_videofile(output_video_path, codec=cpu_codec, audio_codec='aac', threads=4, preset='medium', logger=None)
+                                final_clip.write_videofile(output_video_path, codec=cpu_codec, audio_codec='aac',
+                                                           threads=4, preset='medium', logger=None)
                         else:
                             self.log_video(f"  -> 使用CPU编码 ({cpu_codec})...")
-                            final_clip.write_videofile(output_video_path, codec=cpu_codec, audio_codec='aac', threads=4, preset='medium', logger=None)
+                            final_clip.write_videofile(output_video_path, codec=cpu_codec, audio_codec='aac', threads=4,
+                                                       preset='medium', logger=None)
 
                         video_clip.close()
                         final_clip.close()
                         self.log_video(f"  -> 成功! 输出文件: {os.path.basename(output_video_path)}")
-                        
+
                         gc.collect()
-                        time.sleep(1) # 回收后短暂等待
+                        time.sleep(1)
 
                         try:
-                            path_to_delete_str = os.path.normpath(str(input_video_path))
-                            
-                            # 1. 执行命令，但让程序自己判断成功与否 (check=False)
-                            result = subprocess.run(
-                                f'del "{path_to_delete_str}"',
-                                shell=True,
-                                check=False,  # <--- 关键修改：不自动检查错误
-                                capture_output=True,
-                                text=True
-                            )
-                            
-                            # 2. 第一重确认：检查命令的返回码和错误输出
-                            if result.returncode != 0 or result.stderr:
-                                # 如果返回码不是0，或者标准错误有内容，都算失败
-                                error_info = result.stderr.strip() or f"返回码: {result.returncode}"
-                                self.log_video(f"  -> ❌ 删除命令执行失败: {error_info}")
-                            else:
-                                # 3. 第二重确认：再次检查文件是否真的不存在了
-                                time.sleep(0.5) # 等待文件系统刷新
-                                if not os.path.exists(input_video_path):
-                                    self.log_video(f"  -> ✅ 源视频已删除 (已确认): {video_name}")
-                                else:
-                                    self.log_video(f"  -> ❌ 警告: 命令报告成功但文件依然存在！删除失败！")
-                              
+                            os.remove(input_video_path)
+                            self.log_video(f"  -> ✅ 源视频已删除: {video_name}")
                         except Exception as e:
-                            self.log_video(f"  -> ❌ 执行删除时发生未知异常: {e}")
-                        # --- 结束：三重确认 - 终极删除方案 ---
+                            self.log_video(f"  -> ❌ 删除源视频时发生异常: {e}")
+
                     except Exception as e:
                         self.log_video(f"  -> 错误: 处理视频 {video_name} 时发生严重错误: {e}")
                         if os.path.exists(output_video_path):
                             try:
                                 os.remove(output_video_path)
-                                self.log_video(f"  -> 已删除临时文件: {os.path.basename(output_video_path)}")
                             except OSError:
                                 pass
+                    finally:
+                        # 无论处理成功或失败，都确保清理掉可能生成的临时文件
+                        if temp_file_to_delete and os.path.exists(temp_file_to_delete):
+                            try:
+                                os.remove(temp_file_to_delete)
+                                self.log_video(f"  - 已清理临时文件。")
+                            except OSError as e:
+                                self.log_video(f"  - 警告: 清理临时文件失败: {e}")
+
             self.log_video("\n---=== 所有任务处理完毕！ ===---")
         except Exception as e:
             self.log_video(f"发生未预料的严重错误: {e}")
