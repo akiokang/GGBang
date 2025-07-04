@@ -3,6 +3,7 @@ import customtkinter as ctk
 from tkinter import filedialog, colorchooser, messagebox as tk_messagebox
 import threading
 import subprocess
+import traceback
 import time
 import os
 import gc
@@ -246,12 +247,14 @@ class App(ctk.CTk):
         self.main_tabview.add("卡秒")
         self.main_tabview.add("加滤镜")
         self.main_tabview.add("音频提取")
+        self.main_tabview.add("双屏")
         self.setup_greenscreen_composite_workflow()
         self.setup_video_workflow()
         self.setup_image_workflow()
         self.setup_ai_matting_workflow()
         self.setup_ab_image_workflow()
         self.setup_news_greenscreen_workflow()
+        self.setup_dualscreen_workflow()
         self.setup_video_splitter_workflow()
         self.setup_frame_extractor_workflow()
         self.setup_audio_extraction_workflow()
@@ -273,6 +276,230 @@ class App(ctk.CTk):
         self.load_settings()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        # ==============================================================================
+        # --- 【新增功能】双屏处理模块 ---
+        # ==============================================================================
+
+    def setup_dualscreen_workflow(self):
+        """创建“双屏”拼接功能的UI界面"""
+        tab = self.main_tabview.tab("双屏")
+
+        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # --- 1. 路径设置 ---
+        path_frame = ctk.CTkFrame(main_frame)
+        path_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(path_frame, text="文件路径设置", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
+                                                                                            pady=(5, 10))
+        self.create_folder_selection_row(path_frame, "A文件夹 (上/右):", "选择视频文件夹A (可含子文件夹)",
+                                         "dualscreen_folder_a_entry")
+        self.create_folder_selection_row(path_frame, "B文件夹 (下/左):", "选择视频文件夹B",
+                                         "dualscreen_folder_b_entry")
+        self.create_folder_selection_row(path_frame, "输出文件夹:", "选择处理结果的存放位置",
+                                         "dualscreen_output_folder_entry")
+
+        # --- 2. 模式设置 ---
+        settings_frame = ctk.CTkFrame(main_frame)
+        settings_frame.pack(fill="x", pady=15, anchor="w", padx=10)
+
+        self.dualscreen_portrait_switch = ctk.CTkSwitch(settings_frame, text="竖屏模式 (左右拼接)")
+        self.dualscreen_portrait_switch.pack(side="left", padx=(0, 20))
+
+        self.dualscreen_use_gpu_switch = ctk.CTkSwitch(settings_frame, text="启用GPU加速编码 (NVIDIA)")
+        self.dualscreen_use_gpu_switch.pack(side="left")
+        # --- 3. 开始处理与日志 ---
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=(15, 5))
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.dualscreen_start_button = ctk.CTkButton(button_frame, text="开始双屏合成", height=40,
+                                                     command=self.start_dualscreen_processing)
+        self.dualscreen_start_button.grid(row=0, column=0, padx=(10, 5), sticky="ew")
+        self.dualscreen_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
+                                                    command=lambda: self.video_stop_event.set(), state="disabled",
+                                                    fg_color="red", hover_color="darkred")
+        self.dualscreen_stop_button.grid(row=0, column=1, padx=(5, 10), sticky="ew")
+
+        self.dualscreen_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
+        self.dualscreen_log_textbox.pack(expand=True, fill="both", pady=(10, 5), padx=10)
+
+    def log_dualscreen(self, message, clear=False):
+        """向双屏模块日志框记录信息"""
+        self.after(0, self._update_log, self.dualscreen_log_textbox, message, clear)
+    def start_dualscreen_processing(self):
+        """启动双屏处理的线程"""
+        self.video_stop_event.clear()
+        self.dualscreen_start_button.configure(state="disabled")
+        self.dualscreen_stop_button.configure(state="normal")
+        # 使用新的日志函数来清空日志并显示第一条信息
+        self.log_dualscreen("处理开始...", clear=True)
+        threading.Thread(target=self.run_dualscreen_logic, daemon=True).start()
+
+    def _dualscreen_worker(self, path_a, path_b, output_path, is_portrait_mode,use_gpu):
+        """使用FFmpeg处理单个视频对的核心函数（横屏模式为填充裁剪）"""
+        ffmpeg_path = self._find_executable("ffmpeg")
+        if not ffmpeg_path:
+            self.log_dualscreen("错误：找不到 ffmpeg.exe")
+            return False
+
+        if is_portrait_mode:
+            # 竖屏模式：B在左，A在右，最终分辨率 1080x1080 (1:1)
+            # (这部分逻辑保持不变)
+            filter_complex = (
+                "[1:v]scale=540:1080:force_original_aspect_ratio=decrease,pad=540:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1[left];"
+                "[0:v]scale=540:1080:force_original_aspect_ratio=decrease,pad=540:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1[right];"
+                "[left][right]hstack=inputs=2[v]"
+            )
+        else:
+            # --- 核心修改：默认模式改为“放大并裁剪”来填充画面 ---
+            # 默认模式：A在上，B在下，最终分辨率 1080x1440 (3:4)
+            # 1. scale=-1:720 将视频等比缩放，直到高度为720px。此时宽度会超出1080。
+            # 2. crop=1080:720 从缩放后的画面中央，裁剪出1080x720的区域。
+            filter_complex = (
+                "[0:v]scale=-1:720,crop=1080:720,setsar=1[top];"
+                "[1:v]scale=-1:720,crop=1080:720,setsar=1[bottom];"
+                "[top][bottom]vstack=inputs=2[v]"
+            )
+            # ----------------------------------------------------
+
+        # (后续的音频和命令构建逻辑保持不变)
+        audio_filter = "[0:a][1:a]amerge=inputs=2[a]"
+        map_video = "[v]"
+        map_audio = "[a]"
+        if use_gpu:
+            video_codec = 'h264_nvenc'
+            preset = 'fast'
+            self.log_dualscreen("  -> 模式: GPU加速编码")
+        else:
+            video_codec = 'libx264'
+            preset = 'fast'
+            self.log_dualscreen("  -> 模式: CPU编码")
+        command = [
+            ffmpeg_path, '-y',
+            '-stream_loop', '-1',
+            '-i', path_a,
+            '-i', path_b,
+            '-shortest',
+            '-filter_complex', f"{filter_complex};{audio_filter}",
+            '-map', map_video,
+            '-map', map_audio,
+            '-c:v', 'libx264', '-preset', 'fast',
+            '-ac', '2',
+            output_path
+        ]
+
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8',
+                           creationflags=creation_flags)
+            return True
+        except subprocess.CalledProcessError as e:
+            # 如果GPU编码失败，尝试用CPU重试
+            if use_gpu:
+                self.log_dualscreen("  -> 警告: GPU编码失败，自动尝试用CPU编码重试...")
+                command[-5] = 'libx264'  # 将命令中的编码器改为libx264
+                try:
+                    subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8',
+                                   creationflags=creation_flags)
+                    return True
+                except subprocess.CalledProcessError as e_cpu:
+                    error_log = e_cpu.stderr.strip()
+                    self.log_dualscreen(f"  ❌ CPU重试失败:\n{error_log}\n")
+                    return False
+            else:
+                error_log = e.stderr.strip()
+                self.log_dualscreen(f"  ❌ FFmpeg处理失败:\n{error_log}\n")
+                return False
+
+    def run_dualscreen_logic(self):
+        """【强制诊断版】双屏合成的主逻辑，用于捕获静默失败的错误。"""
+        try:
+            # 我们在每一步都加入直接的print，来定位失败的确切位置
+
+            folder_a = self.dualscreen_folder_a_entry.get()
+
+            folder_b = self.dualscreen_folder_b_entry.get()
+
+            output_folder = self.dualscreen_output_folder_entry.get()
+
+            is_portrait = self.dualscreen_portrait_switch.get() == 1
+
+            use_gpu = self.dualscreen_use_gpu_switch.get() == 1 and self.is_gpu_available
+
+            self.log_dualscreen("🔍 正在扫描视频文件...")
+
+            if not all([folder_a, folder_b, output_folder]):
+                self.log_dualscreen("❌ 错误: 所有文件夹路径都必须填写。")
+                self.after(0, self.dualscreen_start_button.configure, state="normal")
+                self.after(0, self.dualscreen_stop_button.configure, state="disabled")
+                return
+
+            video_files_a = []
+            for root, _, files in os.walk(folder_a):
+                for file in files:
+                    if file.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                        video_files_a.append(os.path.join(root, file))
+
+            video_files_b = []
+            if os.path.exists(folder_b):
+                for file in os.listdir(folder_b):
+                    if file.lower().endswith(('.mp4', '.mov', '.avi', '.mkv')):
+                        video_files_b.append(os.path.join(folder_b, file))
+
+            if not video_files_a or not video_files_b:
+                self.log_dualscreen("❌ 错误: 文件夹A或B中没有找到任何视频文件。")
+                self.after(0, self.dualscreen_start_button.configure, state="normal")
+                self.after(0, self.dualscreen_stop_button.configure, state="disabled")
+                return
+
+            self.log_dualscreen(f"✅ 扫描完成：找到A视频 {len(video_files_a)} 个，B视频 {len(video_files_b)} 个。")
+            random.shuffle(video_files_a)
+            random.shuffle(video_files_b)
+
+            num_to_process = min(len(video_files_a), len(video_files_b))
+            self.log_dualscreen(f"将处理 {num_to_process} 对视频。")
+
+            for i in range(num_to_process):
+                if self.video_stop_event.is_set():
+                    self.log_dualscreen("🔴 任务已由用户中止。")
+                    break
+
+                path_a = video_files_a[i]
+                path_b = video_files_b[i]
+
+                basename_a = os.path.splitext(os.path.basename(path_a))[0]
+                basename_b = os.path.splitext(os.path.basename(path_b))[0]
+                output_filename = f"{basename_a}_vs_{basename_b}.mp4"
+                output_path = os.path.join(output_folder, output_filename)
+
+                self.log_dualscreen(f"\n--- [任务 {i + 1}/{num_to_process}] ---")
+                self.log_dualscreen(f"  A: {os.path.basename(path_a)}")
+                self.log_dualscreen(f"  B: {os.path.basename(path_b)}")
+
+                if self._dualscreen_worker(path_a, path_b, output_path, is_portrait, use_gpu):
+                    self.log_dualscreen(f"  ✅ 成功输出到: {output_filename}")
+                else:
+                    self.log_dualscreen(f"  ❌ 处理失败，请查看日志获取详细错误信息。")
+
+            self.log_dualscreen("\n--- 🎉 所有任务处理完毕！ ---")
+
+        except Exception:
+            # 这是最关键的部分，它会捕获任何错误，并将其完整打印到控制台
+            error_string = traceback.format_exc()
+            print("--- [后台线程发生致命错误] ---")
+            print(error_string)
+            print("---------------------------")
+            self.log_dualscreen(
+                f"❌ 发生致命错误，请查看PyCharm的运行控制台获取详细信息！\n错误类型: {error_string.strip().splitlines()[-1]}")
+
+        finally:
+            # --- 核心修改：使用lambda来修正after函数的调用语法 ---
+            self.after(0, lambda: self.dualscreen_start_button.configure(state="normal"))
+            self.after(0, lambda: self.dualscreen_stop_button.configure(state="disabled"))
+            # ----------------------------------------------------
     # ==============================================================================
     # --- FFmpeg 高性能视频处理模块 (最终、完整、经过验证的版本) ---
     # ==============================================================================
