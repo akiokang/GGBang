@@ -501,7 +501,14 @@ class App(ctk.CTk):
             if not config:
                 self.after(0, self._reset_video_buttons)
                 return
-
+            durations_str = self.video_durations_entry.get()
+            try:
+                # 将逗号分隔的字符串转换为浮点数列表
+                durations_list = [float(d.strip()) for d in durations_str.split('.') if d.strip()]
+            except ValueError:
+                self.log_video("❌ 错误: 视频时长格式不正确，请输入用 . 分隔的数字。")
+                self.after(0, self._reset_video_buttons)
+                return
             video_folder = self.video_folder_entry.get()
             output_folder = self.video_output_folder_entry.get()
             all_input_text = self.video_text_input_box.get("1.0", "end-1c")
@@ -616,6 +623,14 @@ class App(ctk.CTk):
                                 filter_chains.append(
                                     f"{input_stream}[{overlay_stream_index}:v]overlay=(W-w)/2:{y_pos}{output_stream if k < len(text_parts) - 2 else ''}")
                                 last_overlay_bottom_y = y_pos + size[1]
+                        # 为当前视频确定时长
+                        current_duration = durations_list[j % len(durations_list)] if durations_list else 0
+                        duration_param = ""
+                        if current_duration > 0:
+                            adjusted_duration = current_duration + 1
+                            self.log_video(
+                                f"  -> 原始请求时长: {current_duration} 秒。为修正偏差，将使用 {adjusted_duration} 秒进行裁剪。")
+                            duration_param = f"-to {adjusted_duration}"
 
                         # 组合命令
                         ffmpeg_path = self._find_executable("ffmpeg")
@@ -627,6 +642,7 @@ class App(ctk.CTk):
 
                         command_string = (
                             f'"{ffmpeg_path}" -y {input_string} '
+                            f'{duration_param} ' 
                             f'-filter_complex "{filter_complex_string}" '
                             f'-c:v {output_codec} -preset {preset} -c:a aac -b:a 192k '
                             f'"{output_video_path}"'
@@ -2102,6 +2118,7 @@ class App(ctk.CTk):
         settings_frame = ctk.CTkFrame(scrollable_frame)
         settings_frame.pack(fill="x", padx=5, pady=10)
         ctk.CTkLabel(settings_frame, text="2. 功能开关与偏移量", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5,0))
+        self.create_widget_row(settings_frame, "预裁剪时长(秒):", "blur_crop_duration", "4", placeholder="0或留空则不裁剪")
 
         switches_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
         switches_frame.pack(fill="x", padx=10, pady=5)
@@ -2289,11 +2306,16 @@ class App(ctk.CTk):
 
         return np.array(bg_image)
 
-    def _blur_process_video(self, input_path, output_path, use_gpu, content_roi, pip_roi, text_config, offsets):
+    def _blur_process_video(self, input_path, output_path, use_gpu, content_roi, pip_roi, text_config, offsets,crop_duration=0):
         # This is process_video_file, adapted as a class method.
         final_clip, original_clip = None, None
         try:
             original_clip = VideoFileClip(input_path)
+            # --- 新增：在这里执行预裁剪 ---
+            if crop_duration > 0 and original_clip.duration > crop_duration:
+                self.log_blur(f"  -> 预裁剪视频至前 {crop_duration} 秒...")
+                original_clip = original_clip.subclip(0, crop_duration)
+            # ---------------------------
             cx, cy, cw, ch = content_roi
             y_offset_main, y_offset_pip, y_offset_text = offsets['main'], offsets['pip'], offsets['text']
 
@@ -2396,7 +2418,13 @@ class App(ctk.CTk):
             input_dir = self.blur_input_folder_entry.get()
             output_dir = self.blur_output_folder_entry.get()
             self.log_blur("\n★★★ 模板设置完成！即将对所有视频应用相同配置... ★★★")
-
+            # --- 新增：从GUI获取裁剪时长 ---
+            try:
+                duration_str = self.blur_crop_duration_entry.get()
+                crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
+            except (ValueError, TypeError):
+                crop_duration = 0  # 如果输入无效，则不裁剪
+            # ---------------------------
             all_text_lines = self.blur_text_input_area.get("1.0", "end-1c").strip().split('\n')
             all_text_lines = [line.strip() for line in all_text_lines if line.strip()]
 
@@ -2437,7 +2465,7 @@ class App(ctk.CTk):
                     success, message = self._blur_process_video(
                         input_path, output_path, self.blur_use_gpu_switch.get(),
                         content_roi, pip_roi,
-                        current_text_config, offsets_config
+                        current_text_config, offsets_config,crop_duration
                     )
                     self.log_blur(f"✔️ {message}" if success else f"❌ {message}")
                 except Exception as e:
@@ -2465,6 +2493,7 @@ class App(ctk.CTk):
         self.create_folder_selection_row(paths_frame, "内容文件夹 (无绿幕):", "选择包含无绿幕视频的文件夹", "news_content_folder_entry")
         self.create_folder_selection_row(paths_frame, "模板文件夹 (带绿幕):", "选择包含绿幕模板视频的文件夹", "news_template_folder_entry")
         self.create_folder_selection_row(paths_frame, "输出文件夹:", "选择处理结果的存放位置", "news_output_folder_entry")
+        self.create_widget_row(paths_frame, "预裁剪时长(秒):", "news_crop_duration", "4", placeholder="0或留空则不裁剪")
 
         # --- 2. 字幕配置 (使用 .pack 布局) ---
         text_frame = ctk.CTkFrame(scrollable_frame)
@@ -2607,12 +2636,18 @@ class App(ctk.CTk):
         draw.multiline_text(position, wrapped_text, font=font, fill=font_color, align="center")
         return np.array(bg_image)
 
-    def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False, gpu_codec='libx264'):
+    def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False, gpu_codec='libx264',crop_duration=0):
         # This is the process_video_insertion function
         content_clip, template_clip, final_clip = None, None, None
         try:
             content_clip = VideoFileClip(content_path)
             template_clip = VideoFileClip(template_path)
+            # --- 新增：在这里执行预裁剪 ---
+            if crop_duration > 0 and content_clip.duration > crop_duration:
+                self.log_news_greenscreen(f"  -> 预裁剪内容视频至前 {crop_duration} 秒...")
+                content_clip = content_clip.subclip(0, crop_duration)
+            # ---------------------------
+
             x, y, w, h = content_roi
             insert_clip = content_clip.crop(x1=x, y1=y, width=w, height=h)
 
@@ -2708,7 +2743,11 @@ class App(ctk.CTk):
         try:
             content_dir, template_dir, output_dir = self.news_content_folder_entry.get(), self.news_template_folder_entry.get(), self.news_output_folder_entry.get()
             font_file = self.news_font_menu.get()
-
+            try:
+                duration_str = self.news_crop_duration_entry.get()
+                crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
+            except (ValueError, TypeError):
+                crop_duration = 0  # 如果输入无效，则不裁剪
             try: base_path = sys._MEIPASS
             except Exception: base_path = os.path.abspath(os.path.dirname(__file__))
             font_dir = os.path.join(base_path, "zt")
@@ -2775,7 +2814,7 @@ class App(ctk.CTk):
                     success, message = self._news_process_video(
                         content_path, template_path, output_path,
                         template_content_roi, text_config,
-                        use_gpu, gpu_codec
+                        use_gpu, gpu_codec,crop_duration
                     )
                     self.log_news_greenscreen(f"✔️ {message}" if success else f"❌ {message}")
                 except Exception as e:
@@ -2842,12 +2881,12 @@ class App(ctk.CTk):
         if return_frame:
             return frame
 
-    def create_widget_row(self, parent, label, name, val, is_file=False):
+    def create_widget_row(self, parent, label, name, val, is_file=False, placeholder=None):
         f = ctk.CTkFrame(parent, fg_color="transparent")
         f.pack(fill="x", padx=10, pady=2)
         f.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(f, text=label).grid(row=0, column=0, padx=(0,10), sticky="w")
-        e = ctk.CTkEntry(f)
+        ctk.CTkLabel(f, text=label, width=120, anchor="w").grid(row=0, column=0, padx=(0,10), sticky="w")
+        e = ctk.CTkEntry(f, placeholder_text=placeholder) # <-- 增加placeholder_text
         e.grid(row=0, column=1, sticky="ew")
         e.insert(0, val)
         setattr(self, name + "_entry", e)
@@ -3067,6 +3106,11 @@ class App(ctk.CTk):
     def setup_video_main_tab(self, tab):
         self.create_folder_selection_row(tab, "视频文件夹:", "选择包含视频的文件夹", "video_folder_entry")
         self.create_folder_selection_row(tab, "输出文件夹:", "选择视频处理结果的存放位置", "video_output_folder_entry")
+        duration_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        duration_frame.pack(fill="x", padx=10, pady=5, anchor="w")
+        ctk.CTkLabel(duration_frame, text="视频时长秒(用点.分隔):", width=120, anchor="w").pack(side="left")
+        self.video_durations_entry = ctk.CTkEntry(duration_frame, placeholder_text="例: 5,6,5 (与文案数量对应)")
+        self.video_durations_entry.pack(side="left", fill="x", expand=True)
         ctk.CTkLabel(tab, text="输入文案 (用'/'换行, 用'&'分隔块):").pack(anchor="w", padx=10, pady=(10, 0))
         self.video_text_input_box = ctk.CTkTextbox(tab, height=150); self.video_text_input_box.pack(fill="x", padx=10, pady=(5,10), expand=True)
         group_frame = ctk.CTkFrame(tab, fg_color="transparent"); group_frame.pack(fill="x", padx=10, pady=5)
