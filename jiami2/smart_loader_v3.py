@@ -147,46 +147,56 @@ def main():
     fernet_key = base64.urlsafe_b64encode(key)
     f = Fernet(fernet_key)
 
+    is_activated = False  # 设置一个标志位，用于判断授权是否有效
+
+    # 1. 优先检查现有授权文件
     if os.path.exists(license_storage_path):
         try:
             with open(license_storage_path, 'r') as file:
                 license_data = json.load(file)
 
-            stored_machine_id = license_data.get('machine_id')
-            if get_machine_id() != stored_machine_id:
+            # 检查硬件ID是否匹配
+            if get_machine_id() != license_data.get('machine_id'):
                 messagebox.showerror("授权失败", "硬件环境不匹配，此授权已绑定到其他电脑。")
-                return
+                return  # 硬件不匹配是硬性错误，直接退出
 
+            # 检查到期日
             expiration_date_str = license_data.get('expiration_date')
             if expiration_date_str != "permanent":
+                # 【修正】修正了原有多一天的BUG
                 expiration_date = datetime.strptime(expiration_date_str, "%Y-%m-%d")
-                if datetime.now() > expiration_date + timedelta(days=1):
-                    messagebox.showerror("授权已过期", f"您的软件授权已于 {expiration_date_str} 过期。")
-                    return
-
-            decrypted_data = f.decrypt(encrypted_bundle)
-            run_decrypted_app(decrypted_data)
+                if datetime.now() > expiration_date:
+                    # --- 主要修改点 ---
+                    # 授权已过期，不再直接return退出
+                    # 而是弹窗提示后，让程序继续往下走到激活流程
+                    messagebox.showinfo("授权已过期",
+                                        f"您的软件授权已于 {expiration_date_str} 过期。\n请点击“确定”后输入新的注册码以重新激活。")
+                else:
+                    # 授权未过期，标记为已激活
+                    is_activated = True
+            else:
+                # 永久授权，标记为已激活
+                is_activated = True
         except Exception:
-            messagebox.showerror("错误",
-                                 "许可证文件损坏或无效。\n请尝试删除以下文件后重新激活:\n" + license_storage_path)
-    else:
+            # 授权文件损坏，同样让程序继续往下走到激活流程
+            messagebox.showerror("错误", "许可证文件损坏或无效，请重新激活。")
+
+    # 2. 如果未激活（包括首次运行、文件损坏、授权过期），则执行激活流程
+    if not is_activated:
         reg_code = simpledialog.askstring("软件激活", "请输入您的注册码:")
-        if not reg_code: return
+        if not reg_code:
+            return  # 如果用户在激活窗口点击取消，则退出程序
 
         payload = verify_registration_code(reg_code, public_key)
-        if payload:
-            # 新增: 检查注册码中的产品ID是否与本软件匹配
-            if payload.get('product_id') != PRODUCT_ID:
-                messagebox.showerror("激活失败", "无效的注册码。此注册码不适用于本软件。")
-                return
 
+        # 验证注册码是否有效，且产品ID是否匹配
+        if payload and payload.get('product_id') == PRODUCT_ID:
             days_to_expire = payload.get('days', 0)
             if days_to_expire > 0:
                 expiration_date = datetime.now() + timedelta(days=days_to_expire)
                 expiration_date_str = expiration_date.strftime("%Y-%m-%d")
             else:
                 expiration_date_str = "permanent"
-
             new_license_data = {
                 'reg_code': reg_code,
                 'machine_id': get_machine_id(),
@@ -194,14 +204,23 @@ def main():
                 'expiration_date': expiration_date_str
             }
 
+            # --- 关键：使用 'w' 模式写入文件，会直接覆盖旧的 license.dat 文件 ---
             with open(license_storage_path, 'w') as file:
                 json.dump(new_license_data, file)
 
             messagebox.showinfo("成功", "软件激活成功！")
+            is_activated = True  # 激活成功，更新标志位
+        else:
+            messagebox.showerror("激活失败", "无效的注册码或注册码不适用于本软件。")
+            # 激活失败，is_activated 仍为 False，程序将不会运行
+
+    # 3. 最后，只有在授权状态有效时，才运行主程序
+    if is_activated:
+        try:
             decrypted_data = f.decrypt(encrypted_bundle)
             run_decrypted_app(decrypted_data)
-        else:
-            messagebox.showerror("激活失败", "无效的注册码。")
+        except Exception as e:
+            messagebox.showerror("运行错误", f"解密或启动应用程序失败: {e}")
 
 
 if __name__ == '__main__':
