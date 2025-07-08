@@ -1442,7 +1442,7 @@ class App(ctk.CTk):
 
     def _populate_lut_filter_list(self, entry, title):
         """当用户选择滤镜文件夹后，动态生成复选框列表"""
-        path = filedialog.askdirectory(title=title)
+        path = filedialog.askdirectory(title=title,parent=self)
         if not path: return
         entry.delete(0, "end"); entry.insert(0, path)
 
@@ -2825,9 +2825,13 @@ class App(ctk.CTk):
         draw.multiline_text(position, wrapped_text, font=font, fill=font_color, align="center")
         return np.array(bg_image)
 
+    # 最终修正版，请完整替换旧的 _news_process_video 函数
+
+    # 最终修正版，请用此函数完整替换您代码中旧的 _news_process_video 函数
+
     def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False,
                             gpu_codec='libx264', crop_duration=0):
-        """【最终健壮版 - FFmpeg核心 - 修正合成逻辑】"""
+        """【最终健壮版 - FFmpeg核心 - 修正合成逻辑、裁剪逻辑和音频逻辑】"""
         temp_text_image_path = None
         try:
             # --- 步骤 1: 使用 OpenCV 定位模板视频的绿幕区域和尺寸 (保留) ---
@@ -2837,6 +2841,8 @@ class App(ctk.CTk):
 
             template_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             template_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            template_fps = cap.get(cv2.CAP_PROP_FPS)
+            template_duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / template_fps if template_fps > 0 else 0
 
             ret, template_first_frame = cap.read()
             if not ret:
@@ -2882,47 +2888,51 @@ class App(ctk.CTk):
 
             command = [ffmpeg_path, '-y']
 
-            if crop_duration > 0:
-                command.extend(['-t', str(crop_duration)])
             command.extend(['-i', norm_content_path])
             command.extend(['-i', norm_template_path])
-
             if temp_text_image_path:
                 command.extend(['-i', os.path.normpath(temp_text_image_path)])
 
-            # --- 核心逻辑修正 ---
             filters = []
             content_x, content_y, content_w, content_h = content_roi
 
-            # 滤镜1: 裁剪内容视频，并将其缩放到与绿幕区域同样大小，命名为 [content_ready]
-            filters.append(f"[0:v]crop={content_w}:{content_h}:{content_x}:{content_y},scale={gw}:{gh}[content_ready]")
+            final_duration = crop_duration if crop_duration > 0 else template_duration
+            if final_duration <= 0:
+                return False, f"最终计算时长为0或负数，无法处理。原始模板时长: {template_duration}, 用户裁剪时长: {crop_duration}"
 
-            # 滤镜2 (已修正): 将【模板视频】[1:v]作为底图，把准备好的内容 [content_ready] 叠加到绿幕的坐标(gx, gy)上。
-            filters.append(f"[1:v][content_ready]overlay={gx}:{gy}[video_composited]")
-            # --- 修正结束 ---
+            filters.append(f"[0:v]trim=duration={final_duration},setpts=PTS-STARTPTS[trimmed_content_v];"
+                           f"[trimmed_content_v]crop={content_w}:{content_h}:{content_x}:{content_y},scale={gw}:{gh}[content_ready]")
+
+            filters.append(f"[1:v]trim=duration={final_duration},setpts=PTS-STARTPTS[trimmed_template_v]")
+
+            filters.append(f"[0:a]atrim=duration={final_duration},asetpts=PTS-STARTPTS[final_audio]")
+
+            filters.append(f"[trimmed_template_v][content_ready]overlay={gx}:{gy}[video_composited]")
 
             last_stream = "[video_composited]"
             if temp_text_image_path:
                 text_x = (template_width - text_config['box_w']) / 2
                 text_y = gy - text_config['box_h'] - text_config['y_offset']
                 filters.append(f"{last_stream}[2:v]overlay={text_x}:{text_y}[v_out]")
-                final_map = "[v_out]"
+                final_map_v = "[v_out]"
             else:
-                final_map = last_stream
+                filters.append(f"{last_stream}copy[v_out]")
+                final_map_v = "[v_out]"
 
+            # ★★★ 关键修正点 ★★★
+            # 使用分号(;)来正确地连接所有独立的滤镜命令
             filter_complex_string = ";".join(filters)
 
             command.extend(['-filter_complex', filter_complex_string])
-            command.extend(['-map', final_map])
-            command.extend(['-map', '1:a?'])
+
+            command.extend(['-map', final_map_v])
+            command.extend(['-map', '[final_audio]'])
 
             codec_to_use = gpu_codec if use_gpu and self.is_gpu_available else 'libx264'
             command.extend(['-c:v', codec_to_use])
             command.extend(['-preset', 'medium'])
             command.extend(['-c:a', 'aac', '-b:a', '192k'])
-            # 确保输出视频时长与模板视频一致
-            command.extend(['-t', str(cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS))] if cap.get(
-                cv2.CAP_PROP_FPS) > 0 else [])
+
             command.append(norm_output_path)
 
             self.log_news_greenscreen("  -> 正在调用FFmpeg核心进行高速合成...")
@@ -2939,6 +2949,8 @@ class App(ctk.CTk):
             error_log = e.stderr.strip()
             return False, f"FFmpeg 处理失败:\n{error_log}\n"
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             return False, f"处理失败: {e}"
         finally:
             if temp_text_image_path and os.path.exists(temp_text_image_path):
@@ -2988,9 +3000,17 @@ class App(ctk.CTk):
             font_file = self.news_font_menu.get()
             try:
                 duration_str = self.news_crop_duration_entry.get()
-                crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
+                original_crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
             except (ValueError, TypeError):
-                crop_duration = 0  # 如果输入无效，则不裁剪
+                original_crop_duration = 0
+
+            if original_crop_duration > 0:
+                # 在原始时长基础上加1秒
+                crop_duration = original_crop_duration + 1
+                self.log_news_greenscreen(
+                    f"ℹ️ 用户请求时长: {original_crop_duration}秒。系统自动+1秒，将按 {crop_duration}秒 进行裁剪。")
+            else:
+                crop_duration = 0  # 如果用户未输入或输入0，则不裁剪
             try: base_path = sys._MEIPASS
             except Exception: base_path = os.path.abspath(os.path.dirname(__file__))
             font_dir = os.path.join(base_path, "zt")
@@ -3175,17 +3195,17 @@ class App(ctk.CTk):
 
     def _pick_color(self, button_widget, attr_name):
         initial_color = button_widget.cget("text") if button_widget.cget("text").startswith("#") else "#ffffff"
-        color = colorchooser.askcolor(color=initial_color, title="选择颜色")
+        color = colorchooser.askcolor(color=initial_color, title="选择颜色", parent=self)
         if color and color[1]:
             setattr(self, attr_name + "_value", color[1])
             button_widget.configure(text=color[1], fg_color=color[1])
 
     def select_folder_for_entry(self, entry, title):
-        path = filedialog.askdirectory(title=title)
+        path = filedialog.askdirectory(title=title, parent=self)
         if path: entry.delete(0, "end"); entry.insert(0, path)
 
     def select_file_for_entry(self, entry, title, types):
-        path = filedialog.askopenfilename(title=title, filetypes=types)
+        path = filedialog.askopenfilename(title=title, filetypes=types, parent=self)
         if path: entry.delete(0, "end"); entry.insert(0, path)
 
     def _open_folder_path(self, path):
