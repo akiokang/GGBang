@@ -5,6 +5,7 @@
 import customtkinter as ctk
 from tkinter import filedialog, colorchooser, messagebox as tk_messagebox
 import threading
+import queue
 import subprocess
 import traceback
 import time
@@ -17,12 +18,19 @@ import numpy as np
 import re 
 import shutil
 import sys
+import socket
+import struct
+import requests
 import subprocess
 import platform
 from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorClip, ImageClip, ImageSequenceClip
 from moviepy.video.fx import all as vfx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor
 import moviepy.config as cf
+# --- iOS批量传输 全局配置 ---
+MCAST_GRP = '224.0.0.167'
+MCAST_PORT = 53317
+DISCOVERY_DURATION = 50  # 搜索设备的秒数
 # --- 智能配置 ImageMagick 路径 ---
 # 判断程序是否被 PyInstaller 打包
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -322,10 +330,13 @@ class App(ctk.CTk):
         self.news_stop_event = threading.Event()
         self.blur_stop_event = threading.Event()
         self.audio_stop_event = threading.Event()
+        self.ios_transfer_stop_event = threading.Event()
         self.lut_stop_event = threading.Event()
         self.composite_stop_event = threading.Event()
         self.video_clone_stop_event = threading.Event()
         self.dualscreen_stop_event = threading.Event()
+        self.ios_discovery_stop_event = threading.Event()
+        self.device_queue = queue.Queue()
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
 
     def setup_main_ui(self):
@@ -353,6 +364,7 @@ class App(ctk.CTk):
         self.main_tabview.add("加滤镜")
         self.main_tabview.add("音频提取")
         self.main_tabview.add("双屏")
+        self.main_tabview.add("ios批量传输")
 
         # 调用所有功能的UI设置函数
         self.setup_video_workflow()
@@ -365,6 +377,7 @@ class App(ctk.CTk):
         self.setup_news_blur_workflow()
         self.setup_greenscreen_composite_workflow()
         self.setup_video_clone_workflow()
+        self.setup_ios_transfer_workflow()
         self.setup_cut_workflow()
         self.setup_lut_workflow()
         self.setup_audio_extraction_workflow()
@@ -379,9 +392,290 @@ class App(ctk.CTk):
         self.load_settings()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-        # ==============================================================================
-        # --- 【新增功能】双屏处理模块 ---
-        # ==============================================================================
+    # ==============================================================================
+    # --- ios批量传输 功能 (最终健壮版) ---
+    # ==============================================================================
+    def setup_ios_transfer_workflow(self):
+        """创建“ios批量传输”功能的UI界面"""
+        tab = self.main_tabview.tab("ios批量传输")
+        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+        main_frame.grid_columnconfigure(0, weight=1);
+        main_frame.grid_columnconfigure(1, weight=1);
+        main_frame.grid_rowconfigure(1, weight=1)
+        folder_frame = ctk.CTkFrame(main_frame);
+        folder_frame.grid(row=0, column=0, columnspan=2, sticky="ew", pady=5, padx=5)
+        ctk.CTkLabel(folder_frame, text="第一步: 选择来源文件夹", font=ctk.CTkFont(weight="bold")).pack(anchor="w",
+                                                                                                        padx=10,
+                                                                                                        pady=(5,
+                                                                                                              10))
+        self.create_folder_selection_row(folder_frame, "来源文件夹:", "选择包含以设备名命名的子文件夹的目录",
+                                         "ios_source_folder_entry")
+        discover_frame = ctk.CTkFrame(main_frame);
+        discover_frame.grid(row=1, column=0, sticky="nsew", pady=5, padx=(5, 2));
+        discover_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(discover_frame, text="第二步: 搜索iOS设备", font=ctk.CTkFont(weight="bold")).pack(pady=10)
+        discover_button_frame = ctk.CTkFrame(discover_frame, fg_color="transparent");
+        discover_button_frame.pack(fill="x", padx=20, pady=5);
+        discover_button_frame.grid_columnconfigure((0, 1), weight=1)
+        self.ios_discover_btn = ctk.CTkButton(discover_button_frame, text=f"开始搜索 ({DISCOVERY_DURATION}秒)",
+                                              command=self.start_ios_discovery);
+        self.ios_discover_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.ios_cancel_discover_btn = ctk.CTkButton(discover_button_frame, text="取消搜索",
+                                                     command=self.stop_ios_discovery, state="disabled",
+                                                     fg_color="orange", hover_color="#E07A00");
+        self.ios_cancel_discover_btn.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.ios_device_frame = ctk.CTkScrollableFrame(discover_frame, label_text="发现的设备");
+        self.ios_device_frame.pack(fill="both", expand=True, pady=10, padx=10)
+        transfer_frame = ctk.CTkFrame(main_frame);
+        transfer_frame.grid(row=1, column=1, sticky="nsew", pady=5, padx=(2, 5))
+        ctk.CTkLabel(transfer_frame, text="第三步: 开始传输", font=ctk.CTkFont(weight="bold")).pack(pady=10)
+        self.ios_transfer_btn = ctk.CTkButton(transfer_frame, text="启动批量传输", height=50,
+                                              command=self.start_ios_batch_transfer);
+        self.ios_transfer_btn.pack(pady=50, padx=20, fill="x")
+        log_frame = ctk.CTkFrame(main_frame);
+        log_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=5, padx=5);
+        log_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(log_frame, text="实时日志", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
+        self.ios_log_textbox = ctk.CTkTextbox(log_frame, wrap="word", height=150, state="disabled",
+                                              text_color="#A9A9A9");
+        self.ios_log_textbox.pack(fill="both", expand=True, padx=10, pady=5)
+        self.discovered_devices = {}
+
+    def log_ios_transfer(self, message, clear=False):
+        """线程安全地向日志框添加消息"""
+        self.after(0, self._update_log, self.ios_log_textbox, message, clear)
+
+    def start_ios_discovery(self):
+        """启动设备发现线程，并管理按钮状态"""
+        self.ios_discovery_stop_event.clear()
+        self.ios_discover_btn.configure(state="disabled")
+        self.ios_cancel_discover_btn.configure(state="normal")
+        for widget in self.ios_device_frame.winfo_children():
+            widget.destroy()
+        self.discovered_devices = {}
+        self.log_ios_transfer("--- 开始搜索网络中的iOS设备... ---", clear=True)
+        discovery_thread = threading.Thread(target=self._ios_discover_devices_thread, daemon=True)
+        discovery_thread.start()
+        self.after(100, self._ios_update_ui_from_queue)
+
+    def stop_ios_discovery(self):
+        """发送停止信号给搜索线程"""
+        self.log_ios_transfer("--- 正在取消搜索... ---")
+        self.ios_discovery_stop_event.set()
+        self.ios_cancel_discover_btn.configure(state="disabled")
+
+    def _reset_ios_discovery_buttons(self):
+        """将搜索相关的按钮重置为初始状态"""
+        self.ios_discover_btn.configure(state="normal")
+        self.ios_cancel_discover_btn.configure(state="disabled")
+
+    def _ios_update_ui_from_queue(self):
+        """在主线程中运行，定时检查队列并更新UI"""
+        while not self.device_queue.empty():
+            try:
+                name, address = self.device_queue.get_nowait()
+                if name not in self.discovered_devices:
+                    self.discovered_devices[name] = address
+                    self.log_ios_transfer(f"  -> 发现设备: {name} ({address})")
+                    device_label = ctk.CTkLabel(self.ios_device_frame, text=f"📱 {name} ({address})")
+                    device_label.pack(anchor="w", padx=10, pady=2)
+            except queue.Empty:
+                break
+
+        if not self.ios_discovery_stop_event.is_set():
+            self.after(100, self._ios_update_ui_from_queue)
+
+    def _ios_discover_devices_thread(self):
+        """在后台线程中运行，只负责监听和将结果放入队列"""
+        end_time = time.time() + DISCOVERY_DURATION
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', MCAST_PORT))
+            mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+            while time.time() < end_time and not self.ios_discovery_stop_event.is_set():
+                try:
+                    sock.settimeout(0.5)
+                    data, addr = sock.recvfrom(1024)
+                    message = json.loads(data.decode('utf-8'))
+                    name, ip, port = message.get('name'), message.get('ip'), message.get('port')
+                    if name and ip and port:
+                        self.device_queue.put((name, f"{ip}:{port}"))
+                except socket.timeout:
+                    continue
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        except OSError:
+            self.log_ios_transfer("错误: 端口已被占用。脚本是否已在运行?")
+        except Exception as e:
+            self.log_ios_transfer(f"设备发现线程出错: {e}")
+        finally:
+            self.ios_discovery_stop_event.set()
+            self.after(0, lambda: self._reset_ios_discovery_buttons())
+            self.after(0,
+                       lambda: self.log_ios_transfer(f"--- 搜索结束。共发现 {len(self.discovered_devices)} 台设备。 ---"))
+
+    def start_ios_batch_transfer(self):
+        """启动批量传输的主函数"""
+        if not self.ios_source_folder_entry.get():
+            self.log_ios_transfer("错误: 请先选择来源文件夹!")
+            return
+        if not self.discovered_devices:
+            self.log_ios_transfer("错误: 未发现任何设备，请先搜索!")
+            return
+
+        self.ios_transfer_btn.configure(state="disabled")
+        self.log_ios_transfer("\n================ 开始批量传输 ===============")
+
+        transfer_thread = threading.Thread(target=self._ios_batch_transfer_thread, daemon=True)
+        transfer_thread.start()
+
+    def _ios_batch_transfer_thread(self):
+        """批量传输的实际工作线程"""
+        source_folder = self.ios_source_folder_entry.get()
+        try:
+            subfolders = [d for d in os.listdir(source_folder) if os.path.isdir(os.path.join(source_folder, d))]
+        except FileNotFoundError:
+            self.log_ios_transfer(f"严重错误: 来源文件夹不存在: {source_folder}")
+            self.after(0, lambda: self.ios_transfer_btn.configure(state="normal"))
+            return
+
+        transfer_threads = []
+        for folder_name in subfolders:
+            if folder_name in self.discovered_devices:
+                device_address = self.discovered_devices[folder_name]
+                folder_path = os.path.join(source_folder, folder_name)
+                files_to_send = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if
+                                 os.path.isfile(os.path.join(folder_path, f))]
+
+                if files_to_send:
+                    t = threading.Thread(target=self._ios_transfer_files_to_device,
+                                         args=(folder_name, device_address, files_to_send), daemon=True)
+                    transfer_threads.append(t)
+                    t.start()
+                else:
+                    self.log_ios_transfer(f"注意: 文件夹 '{folder_name}' 为空，跳过。")
+            else:
+                self.log_ios_transfer(f"警告: 文件夹 '{folder_name}' 存在，但网络上未发现同名设备。")
+
+        for t in transfer_threads:
+            t.join()
+
+        self.log_ios_transfer("\n================ 所有任务已完成 ===============")
+        self.after(0, lambda: self.ios_transfer_btn.configure(state="normal"))
+
+    def _ios_transfer_files_to_device(self, device_name, address, file_list):
+        """为单个设备发送所有文件 (修正为原始的二进制流发送方式)"""
+        self.log_ios_transfer(f"--- 开始向设备 '{device_name}' ({address}) 发送文件 ---")
+        base_url = f'http://{address}/upload'
+        success_count, fail_count = 0, 0
+
+        for f_path in file_list:
+            if self.ios_transfer_stop_event.is_set(): break
+
+            filename = os.path.basename(f_path)
+            headers = {'X-File-Name': filename.encode('utf-8')}
+
+            try:
+                with open(f_path, 'rb') as f:
+                    response = requests.post(base_url, data=f, headers=headers, timeout=90)
+
+                if response.status_code == 200:
+                    self.log_ios_transfer(f"  [成功] {filename} -> {device_name}")
+                    success_count += 1
+                else:
+                    self.log_ios_transfer(
+                        f"  [失败] {filename} -> {device_name} (服务器返回: {response.status_code} {response.text})")
+                    fail_count += 1
+            except requests.exceptions.RequestException as e:
+                self.log_ios_transfer(f"  [错误] {filename} -> {device_name} (连接或传输失败: {e})")
+                fail_count += 1
+
+        self.log_ios_transfer(f"--- 设备 '{device_name}' 传输完成: {success_count} 成功, {fail_count} 失败 ---")
+    def log_ios_transfer(self, message, clear=False):
+        self.after(0, self._update_log, self.ios_log_textbox, message, clear)
+
+    def start_ios_discovery(self):
+        self.ios_discovery_stop_event.clear()
+        self.ios_discover_btn.configure(state="disabled")
+        self.ios_cancel_discover_btn.configure(state="normal")
+        for widget in self.ios_device_frame.winfo_children(): widget.destroy()
+        self.discovered_devices = {}
+        self.log_ios_transfer("--- 开始搜索网络中的iOS设备... ---", clear=True)
+
+        # 启动后台的“生产者”线程
+        discovery_thread = threading.Thread(target=self._ios_discover_devices_thread, daemon=True)
+        discovery_thread.start()
+
+        # 启动前台的“消费者”UI轮询器
+        self.after(100, self._ios_update_ui_from_queue)
+
+    def stop_ios_discovery(self):
+        self.log_ios_transfer("--- 正在取消搜索... ---")
+        self.ios_discovery_stop_event.set()
+        self.ios_cancel_discover_btn.configure(state="disabled")
+
+    def _reset_ios_discovery_buttons(self):
+        self.ios_discover_btn.configure(state="normal")
+        self.ios_cancel_discover_btn.configure(state="disabled")
+
+    def _ios_update_ui_from_queue(self):
+        """【消费者】在主线程中运行，定时检查队列并更新UI"""
+        # 处理队列中的所有当前消息
+        while not self.device_queue.empty():
+            try:
+                name, address = self.device_queue.get_nowait()
+                if name not in self.discovered_devices:
+                    self.discovered_devices[name] = address
+                    self.log_ios_transfer(f"  -> 发现设备: {name} ({address})")
+                    device_label = ctk.CTkLabel(self.ios_device_frame, text=f"📱 {name} ({address})")
+                    device_label.pack(anchor="w", padx=10, pady=2)
+            except queue.Empty:
+                break
+
+        # 检查是否需要继续轮询
+        if not self.ios_discovery_stop_event.is_set():
+            self.after(100, self._ios_update_ui_from_queue)  # 100ms后再次检查
+
+    def _ios_discover_devices_thread(self):
+        """【生产者】在后台线程中运行，只负责监听和将结果放入队列"""
+        end_time = time.time() + DISCOVERY_DURATION
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('', MCAST_PORT))
+            mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+            while time.time() < end_time and not self.ios_discovery_stop_event.is_set():
+                try:
+                    sock.settimeout(0.5)
+                    data, addr = sock.recvfrom(1024)
+                    message = json.loads(data.decode('utf-8'))
+                    name, ip, port = message.get('name'), message.get('ip'), message.get('port')
+                    if name and ip and port:
+                        self.device_queue.put((name, f"{ip}:{port}"))
+                except socket.timeout:
+                    continue  # 超时是正常的，继续循环检查停止信号
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        except OSError:
+            self.log_ios_transfer("错误: 端口已被占用。脚本是否已在运行?")
+        except Exception as e:
+            self.log_ios_transfer(f"设备发现线程出错: {e}")
+        finally:
+            self.ios_discovery_stop_event.set()  # 确保轮询器最终会停止
+            self.after(0, lambda: self._reset_ios_discovery_buttons())
+            self.after(0, lambda: self.log_ios_transfer(
+                f"--- 搜索结束。共发现 {len(self.discovered_devices)} 台设备。 ---"))
+
+    # ... (start_ios_batch_transfer, _ios_batch_transfer_thread, 和 _ios_transfer_files_to_device 函数保持不变)
+    # ==============================================================================
+    # --- 【新增功能】双屏处理模块 ---
+    # ==============================================================================
 
     def setup_dualscreen_workflow(self):
         """创建“双屏”拼接功能的UI界面"""
