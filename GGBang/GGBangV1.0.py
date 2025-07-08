@@ -23,6 +23,31 @@ from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorCli
 from moviepy.video.fx import all as vfx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor
 import moviepy.config as cf
+
+
+def _find_executable(name):  # <-- 确保删掉了 self,
+    """查找 ffmpeg 或 ffprobe 的路径"""
+    executable_name = f"{name}.exe" if sys.platform.startswith("win") else name
+
+    # 检查程序打包路径
+    if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
+        local_path = os.path.join(sys._MEIPASS, "ffmpeg", executable_name)
+        if os.path.isfile(local_path):
+            return local_path
+
+    # 检查开发环境相对路径
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.join(current_dir, "ffmpeg", executable_name)
+    if os.path.isfile(local_path):
+        return local_path
+
+    # 检查系统 PATH
+    system_path = shutil.which(executable_name)
+    if system_path:
+        return system_path
+
+    return None
+
 # --- 智能配置 ImageMagick 路径 ---
 # 判断程序是否被 PyInstaller 打包
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -246,16 +271,7 @@ class App(ctk.CTk):
         # 3. 为所有功能创建停止事件
         self.video_stop_event = threading.Event()
         self.image_stop_event = threading.Event()
-        self.ai_matting_stop_event = threading.Event()
         self.ab_image_stop_event = threading.Event()
-        self.cut_stop_event = threading.Event()
-        self.news_stop_event = threading.Event()
-        self.blur_stop_event = threading.Event()
-        self.audio_stop_event = threading.Event()
-        self.lut_stop_event = threading.Event()
-        self.composite_stop_event = threading.Event()
-        self.video_clone_stop_event = threading.Event()
-        self.dualscreen_stop_event = threading.Event()
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
 
     def setup_main_ui(self):
@@ -344,8 +360,8 @@ class App(ctk.CTk):
 
     def _dualscreen_worker(self, path_a, path_b, output_path, is_portrait_mode, use_gpu):
         """【最终健壮版】使用FFmpeg处理单个视频对，并智能处理音频"""
-        ffmpeg_path = self._find_executable("ffmpeg")
-        ffprobe_path = self._find_executable("ffprobe")
+        ffmpeg_path = _find_executable("ffmpeg")
+        ffprobe_path = _find_executable("ffprobe")
         if not ffmpeg_path or not ffprobe_path:
             self.log_dualscreen("错误：找不到 ffmpeg.exe 或 ffprobe.exe")
             return False
@@ -357,7 +373,7 @@ class App(ctk.CTk):
 
         def has_audio(video_path):
             try:
-                # 使用 self._find_executable 找到的 ffprobe_path
+                # 使用 _find_executable 找到的 ffprobe_path
                 cmd_probe = [ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name",
                              "-of", "default=noprint_wrappers=1:nokey=1", os.path.normpath(video_path)]
                 result = subprocess.run(cmd_probe, check=True, capture_output=True, text=True,
@@ -791,7 +807,7 @@ class App(ctk.CTk):
                                 f"  -> 原始请求时长: {current_duration} 秒。为修正偏差，将使用 {adjusted_duration} 秒进行裁剪。")
                             duration_param = f"-to {adjusted_duration}"
 
-                        safe_ffmpeg_path = str(self._find_executable("ffmpeg")).replace('\\', '/')
+                        safe_ffmpeg_path = str(_find_executable("ffmpeg")).replace('\\', '/')
                         safe_video_path = str(corrected_video_path).replace('\\', '/')
                         safe_output_path = str(output_video_path).replace('\\', '/')
 
@@ -1172,7 +1188,7 @@ class App(ctk.CTk):
 
                         vf_string = ",".join(all_filters) if all_filters else "null"
 
-                        safe_ffmpeg_path = str(self._find_executable("ffmpeg")).replace('\\', '/')
+                        safe_ffmpeg_path = str(_find_executable("ffmpeg")).replace('\\', '/')
                         safe_corrected_video_path = str(corrected_video_path).replace('\\', '/')
                         safe_output_video_path = str(output_video_path).replace('\\', '/')
 
@@ -1289,8 +1305,8 @@ class App(ctk.CTk):
                 self.log_composite("❌ 错误: 绿幕文件夹或背景文件夹中没有找到视频文件。")
                 return
 
-            ffmpeg_path = self._find_executable("ffmpeg")
-            ffprobe_path = self._find_executable("ffprobe")
+            ffmpeg_path = _find_executable("ffmpeg")
+            ffprobe_path = _find_executable("ffprobe")
             if not ffmpeg_path or not ffprobe_path:
                 self.log_composite("❌ 错误: 找不到 ffmpeg.exe 或 ffprobe.exe")
                 return
@@ -1526,7 +1542,7 @@ class App(ctk.CTk):
         """
         self.log_lut(f"  -> 使用FFmpeg引擎处理滤镜...")
 
-        ffmpeg_path = self._find_executable("ffmpeg")
+        ffmpeg_path = _find_executable("ffmpeg")
         if not ffmpeg_path:
             self.log_lut("  ❌ 错误: 找不到 ffmpeg.exe。")
             return False
@@ -1753,164 +1769,11 @@ class App(ctk.CTk):
     # ==============================================================================
     # --- 视频克隆 (新功能) ---
     # ==============================================================================
-    def setup_video_clone_workflow(self):
-        """创建视频克隆功能的UI界面"""
-        tab = self.main_tabview.tab("视频克隆")
 
-        ctk.CTkLabel(tab, text="功能说明：将原视频按“正放->倒放->正放”顺序循环拼接，直至达到指定的总时长。",
-                     wraplength=400).pack(anchor="w", padx=10, pady=(10, 10))
 
-        # --- 路径设置 ---
-        ctk.CTkLabel(tab, text="1. 设置路径", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                                                    pady=(5, 5))
-        self.create_folder_selection_row(tab, "原视频文件夹:", "选择包含视频的文件夹 (可含子文件夹)",
-                                         "clone_input_folder_entry")
-        self.create_folder_selection_row(tab, "输出文件夹:", "选择处理结果的存放位置", "clone_output_folder_entry")
 
-        # --- 参数设置 ---
-        ctk.CTkLabel(tab, text="2. 设置参数", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                                                    pady=(15, 5))
-        duration_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        duration_frame.pack(fill="x", padx=10, pady=5)
-        ctk.CTkLabel(duration_frame, text="目标总时长 (秒):", width=120, anchor="w").pack(side="left")
-        self.clone_total_duration_entry = ctk.CTkEntry(duration_frame, placeholder_text="例如: 13")
-        self.clone_total_duration_entry.insert(0, "15")  # 默认值
-        self.clone_total_duration_entry.pack(side="left", fill="x", expand=True)
 
-        # --- 开始处理 ---
-        run_frame = ctk.CTkFrame(tab)
-        run_frame.pack(fill="x", padx=10, pady=(20, 10))
-        ctk.CTkLabel(run_frame, text="3. 开始处理", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                                                          pady=5)
 
-        button_frame = ctk.CTkFrame(run_frame, fg_color="transparent")
-        button_frame.pack(fill="x", pady=10)
-        button_frame.grid_columnconfigure((0, 1), weight=1)
-
-        self.clone_start_button = ctk.CTkButton(button_frame, text="开始批量克隆视频", height=40,
-                                                command=self.start_video_clone_processing)
-        self.clone_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
-
-        self.clone_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
-                                               command=self.stop_video_clone_processing, state="disabled",
-                                               fg_color="red", hover_color="darkred")
-        self.clone_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
-
-        # --- 日志区域 ---
-        self.clone_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9")
-        self.clone_log_textbox.pack(expand=True, fill="both", padx=10, pady=(5, 10))
-
-    def log_video_clone(self, message, clear=False):
-        self.after(0, self._update_log, self.clone_log_textbox, message, clear)
-
-    def start_video_clone_processing(self):
-        pass
-
-    def stop_video_clone_processing(self):
-        pass
-
-    def _reset_video_clone_buttons(self):
-        pass
-    def _find_executable(self, name):
-        """查找 ffmpeg 或 ffprobe 的路径"""
-        executable_name = f"{name}.exe" if sys.platform.startswith("win") else name
-
-        # 检查程序打包路径
-        if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
-            local_path = os.path.join(sys._MEIPASS, "ffmpeg", executable_name)
-            if os.path.isfile(local_path):
-                return local_path
-
-        # 检查开发环境相对路径
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        local_path = os.path.join(current_dir, "ffmpeg", executable_name)
-        if os.path.isfile(local_path):
-            return local_path
-
-        # 检查系统 PATH
-        system_path = shutil.which(executable_name)
-        if system_path:
-            return system_path
-
-        return None
-    def run_video_clone_logic(self):
-        try:
-            input_dir = self.clone_input_folder_entry.get()
-            output_dir = self.clone_output_folder_entry.get()
-
-            if not all([input_dir, output_dir]):
-                self.log_video_clone("❌ 错误: 原视频文件夹和输出文件夹都必须填写。")
-                return
-
-            try:
-                total_duration = float(self.clone_total_duration_entry.get())
-                if total_duration <= 0: raise ValueError
-            except (ValueError, TypeError):
-                self.log_video_clone("❌ 错误: 目标总时长必须是一个有效的正数。")
-                return
-
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            video_files = []
-            for dirpath, _, filenames in os.walk(input_dir):
-                for filename in filenames:
-                    if self.video_clone_stop_event.is_set(): break
-                    if filename.lower().endswith(('.mp4', '.avi', '.mkv', '.mov')):
-                        video_files.append(os.path.join(dirpath, filename))
-                if self.video_clone_stop_event.is_set(): break
-
-            if not video_files:
-                self.log_video_clone("ℹ️ 在指定的视频文件夹中未找到任何视频文件。")
-                return
-
-            self.log_video_clone(f"🔍 找到 {len(video_files)} 个视频文件，准备开始处理...")
-
-            processed_count = 0
-            for i, video_path in enumerate(video_files):
-                if self.video_clone_stop_event.is_set(): break
-
-                relative_dir = os.path.relpath(os.path.dirname(video_path), input_dir)
-                target_output_dir = os.path.join(output_dir, relative_dir)
-                if not os.path.exists(target_output_dir): os.makedirs(target_output_dir)
-
-                base_name, ext = os.path.splitext(os.path.basename(video_path))
-                output_path = os.path.join(target_output_dir, f"{base_name}_cloned{ext}")
-
-                self.log_video_clone(
-                    f"\n--- [任务 {i + 1}/{len(video_files)}] 正在处理: {os.path.basename(video_path)} ---")
-
-                success = self._video_clone_worker(video_path, output_path, total_duration)
-                if success:
-                    processed_count += 1
-                    # --- 新增的删除逻辑 ---
-                    try:
-                        self.log_video_clone(f"  -> 正在删除用过的原视频: {os.path.basename(video_path)}")
-                        os.remove(video_path)
-                        self.log_video_clone(f"  🗑️  原视频已成功删除。")
-                    except OSError as e:
-                        self.log_video_clone("\n" + "=" * 50)
-                        self.log_video_clone(f"  ❌ 警告: 视频处理成功，但删除原视频失败！")
-                        self.log_video_clone(f"  -> 文件路径: {video_path}")
-                        self.log_video_clone(f"  -> 失败原因: {e}")
-                        self.log_video_clone(
-                            f"  -> 可能原因：请检查程序是否有此文件夹的删除权限，或文件是否被其他程序占用。")
-                        self.log_video_clone("=" * 50 + "\n")
-                    # --- 删除逻辑结束 ---
-
-            if self.video_clone_stop_event.is_set():
-                self.log_video_clone("🔴 任务已由用户中止。")
-            else:
-                self.log_video_clone(f"\n--- 🎉 批量处理完成 ---")
-                self.log_video_clone(f"共成功处理了 {processed_count} 个视频文件。")
-
-        except Exception as e:
-            self.log_video_clone(f"发生未预料的严重错误: {e}")
-        finally:
-            self.after(0, self._reset_video_clone_buttons)
-
-    def _video_clone_worker(self, video_path, output_path, total_duration):
-        pass
        # ==============================================================================
     # --- 音频提取 (新功能) ---
     # ==============================================================================
@@ -2176,7 +2039,7 @@ class App(ctk.CTk):
                 return
 
             # 使用通用的 _find_executable 函数
-            ffmpeg_executable = self._find_executable("ffmpeg")
+            ffmpeg_executable = _find_executable("ffmpeg")
             if not ffmpeg_executable:
                 self.log_cut("错误: 找不到 FFmpeg。请确保已正确安装或放置在程序目录的ffmpeg文件夹内。")
                 return
@@ -2648,7 +2511,7 @@ class App(ctk.CTk):
                 self.log_news_greenscreen(f"  -> 临时文字图层已保存: {os.path.basename(temp_text_image_path)}")
 
             # --- 步骤 3: 构建并执行修正后的 FFmpeg 命令 ---
-            ffmpeg_path = self._find_executable("ffmpeg")
+            ffmpeg_path = _find_executable("ffmpeg")
             if not ffmpeg_path:
                 return False, "找不到 ffmpeg.exe"
 
@@ -3243,7 +3106,7 @@ class App(ctk.CTk):
 
             try:
                 # 查找ffmpeg路径
-                ffmpeg_path = self._find_executable("ffmpeg")
+                ffmpeg_path = _find_executable("ffmpeg")
                 if not ffmpeg_path:
                     logger("  ❌ [致命错误] 找不到ffmpeg.exe，无法修正MOV文件。")
                     return None, None
@@ -3269,7 +3132,10 @@ class App(ctk.CTk):
                 if sys.platform == 'win32':
                     # 如果是Windows，则使用“无窗口”标志
                     creation_flags = subprocess.CREATE_NO_WINDOW
-                subprocess.run(command, shell=True, check=True,
+
+                # --- 核心修正点 ---
+                # 将 shell=True 改为 shell=False，这是更稳定和推荐的做法
+                subprocess.run(command, shell=False, check=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                creationflags=creation_flags)
                 logger("  - ✅ 修正成功，后续将使用此临时文件。")
@@ -3930,7 +3796,7 @@ class App(ctk.CTk):
         # 注意：在复制流模式下，GPU加速开关无效，因为没有进行视频编码
         generated_count = 0
         try:
-            ffmpeg_path = self._find_executable("ffmpeg")
+            ffmpeg_path = _find_executable("ffmpeg")
             if not ffmpeg_path:
                 self.log_splitter(f"  ❌ 错误: 找不到 ffmpeg.exe")
                 return 0
@@ -4079,10 +3945,24 @@ class App(ctk.CTk):
         return overlay_image
 
     def save_settings(self):
-        """只保存保留功能的设置"""
+        """(精简版) 只保存5个核心功能的配置"""
         settings = {
+            'path_settings': {
+                'video_folder': self.video_folder_entry.get(),
+                'video_output_folder': self.video_output_folder_entry.get(),
+                'image_folder': self.image_folder_entry.get(),
+                'image_output_folder': self.image_output_folder_entry.get(),
+                'splitter_input_folder': self.splitter_input_folder_entry.get(),
+                'splitter_output_folder': self.splitter_output_folder_entry.get(),
+                'extractor_input_folder': self.extractor_input_folder_entry.get(),
+                'extractor_output_folder': self.extractor_output_folder_entry.get(),
+                'ab_image_source_folder': self.ab_image_source_folder_entry.get(),
+                'ab_greenscreen_folder': self.ab_greenscreen_folder_entry.get(),
+                'ab_output_folder': self.ab_output_folder_entry.get(),
+            },
             'video_settings': {
                 'text_input': self.video_text_input_box.get("1.0", "end-1c"),
+                'durations': self.video_durations_entry.get(),
                 'num_groups': self.video_num_groups_entry.get(),
                 'use_gpu': self.video_use_gpu_switch.get(), 'shared_font_file': self.video_shared_font_file_entry.get(),
                 'shared_size': self.video_shared_size_entry.get(),
@@ -4133,6 +4013,7 @@ class App(ctk.CTk):
             print(f"Error saving settings: {e}")
 
     def load_settings(self):
+        """(最终完整版) 加载所有保留功能的配置，包括详细参数"""
         try:
             with open(self.SETTINGS_FILE, 'r', encoding='utf-8') as f:
                 settings = json.load(f)
@@ -4141,48 +4022,119 @@ class App(ctk.CTk):
             self.settings_loaded = False
             return
 
-        # 加载 视频处理 设置
+        # --- 内部辅助函数 ---
+        def _set_entry_text(entry_widget, text):
+            # 检查以确保控件存在且值不为None
+            if entry_widget and text is not None:
+                entry_widget.delete(0, "end")
+                entry_widget.insert(0, str(text))  # 转换为str确保兼容
+
+        def _set_textbox_text(textbox_widget, text):
+            if textbox_widget and text is not None:
+                textbox_widget.delete("1.0", "end")
+                textbox_widget.insert("1.0", text)
+
+        # --- 1. 加载文件路径 ---
+        paths = settings.get('path_settings', {})
+        _set_entry_text(getattr(self, 'video_folder_entry', None), paths.get('video_folder'))
+        _set_entry_text(getattr(self, 'video_output_folder_entry', None), paths.get('video_output_folder'))
+        _set_entry_text(getattr(self, 'image_folder_entry', None), paths.get('image_folder'))
+        _set_entry_text(getattr(self, 'image_output_folder_entry', None), paths.get('image_output_folder'))
+        _set_entry_text(getattr(self, 'splitter_input_folder_entry', None), paths.get('splitter_input_folder'))
+        _set_entry_text(getattr(self, 'splitter_output_folder_entry', None), paths.get('splitter_output_folder'))
+        _set_entry_text(getattr(self, 'extractor_input_folder_entry', None), paths.get('extractor_input_folder'))
+        _set_entry_text(getattr(self, 'extractor_output_folder_entry', None), paths.get('extractor_output_folder'))
+        _set_entry_text(getattr(self, 'ab_image_source_folder_entry', None), paths.get('ab_image_source_folder'))
+        _set_entry_text(getattr(self, 'ab_greenscreen_folder_entry', None), paths.get('ab_greenscreen_folder'))
+        _set_entry_text(getattr(self, 'ab_output_folder_entry', None), paths.get('ab_output_folder'))
+
+        # --- 2. 加载视频处理的详细参数 ---
         vs = settings.get('video_settings', {})
-        self.video_text_input_box.delete("1.0", "end");
-        self.video_text_input_box.insert("1.0", vs.get('text_input', ''))
-        self.video_num_groups_entry.delete(0, 'end');
-        self.video_num_groups_entry.insert(0, vs.get('num_groups', '1'))
-        if vs.get('use_gpu', 0):
-            self.video_use_gpu_switch.select()
-        else:
-            self.video_use_gpu_switch.deselect()
-        # ... 此处省略了所有 video_settings 的详细加载代码，因为它们在原文件中是正确的，保持不变即可
+        if vs:
+            _set_textbox_text(self.video_text_input_box, vs.get('text_input', ''))
+            _set_entry_text(self.video_durations_entry, vs.get('durations'))
+            _set_entry_text(self.video_num_groups_entry, vs.get('num_groups', '1'))
+            if vs.get('use_gpu'):
+                self.video_use_gpu_switch.select()
+            else:
+                self.video_use_gpu_switch.deselect()
 
-        # 加载 图片处理 设置
+            # 共享样式
+            _set_entry_text(self.video_shared_font_file_entry, vs.get('shared_font_file'))
+            _set_entry_text(self.video_shared_size_entry, vs.get('shared_size'))
+            _set_entry_text(self.video_shared_max_width_ratio_entry, vs.get('shared_max_width_ratio'))
+            _set_entry_text(self.video_shared_padding_horizontal_entry, vs.get('shared_padding_horizontal'))
+            _set_entry_text(self.video_shared_padding_vertical_entry, vs.get('shared_padding_vertical'))
+            _set_entry_text(self.video_shared_stroke_width_entry, vs.get('shared_stroke_width'))
+            _set_entry_text(self.video_shared_corner_radius_entry, vs.get('shared_corner_radius'))
+            if vs.get('no_background'):
+                self.video_no_bg_switch.select()
+            else:
+                self.video_no_bg_switch.deselect()
+
+            # 主文案
+            _set_entry_text(self.video_main_pos_x_entry, vs.get('main_pos_x'))
+            _set_entry_text(self.video_main_pos_y_entry, vs.get('main_pos_y'))
+            self._update_color_widget('video_main_color_text', vs.get('main_color_text', '#FFFFFF'))
+            self._update_color_widget('video_main_color_stroke', vs.get('main_color_stroke', '#000000'))
+            self._update_color_widget('video_main_color_bg', vs.get('main_color_bg', 'rgba(0,0,0,0.5)'))
+
+            # 次文案
+            _set_entry_text(self.video_sub1_offset_y_entry, vs.get('sub1_offset_y'))
+            self._update_color_widget('video_sub1_color_text', vs.get('sub1_color_text', '#FFFFFF'))
+            self._update_color_widget('video_sub1_color_stroke', vs.get('sub1_color_stroke', '#000000'))
+            self._update_color_widget('video_sub1_color_bg', vs.get('sub1_color_bg', 'rgba(0,0,0,0.5)'))
+            _set_entry_text(self.video_sub2_offset_y_entry, vs.get('sub2_offset_y'))
+            self._update_color_widget('video_sub2_color_text', vs.get('sub2_color_text', '#FFFFFF'))
+            self._update_color_widget('video_sub2_color_stroke', vs.get('sub2_color_stroke', '#000000'))
+            self._update_color_widget('video_sub2_color_bg', vs.get('sub2_color_bg', 'rgba(0,0,0,0.5)'))
+
+        # --- 3. 加载图片处理的详细参数 ---
         imgs = settings.get('image_settings', {})
-        self.image_text_input_box.delete("1.0", "end");
-        self.image_text_input_box.insert("1.0", imgs.get('text_input', ''))
-        # ... 此处省略了所有 image_settings 的详细加载代码，保持不变即可
+        if imgs:
+            _set_textbox_text(self.image_text_input_box, imgs.get('text_input', ''))
+            _set_entry_text(self.image_num_groups_entry, imgs.get('num_groups', '1'))
+            _set_entry_text(self.image_font_path_entry, imgs.get('font_path'))
+            _set_entry_text(self.image_font_size_entry, imgs.get('font_size'))
+            self._update_color_widget('image_font_color', imgs.get('font_color', '#000000'))
+            self._update_color_widget('image_font_background_color', imgs.get('font_background_color', '#FFFFFF'))
+            _set_entry_text(self.image_max_text_width_ratio_entry, imgs.get('max_text_width_ratio'))
+            _set_entry_text(self.image_corner_radius_entry, imgs.get('corner_radius'))
+            _set_entry_text(self.image_text_padding_entry, imgs.get('text_padding'))
+            if hasattr(self, 'image_text_align_in_block_menu'): self.image_text_align_in_block_menu.set(
+                imgs.get('text_align_in_block', 'center'))
+            _set_textbox_text(self.image_text_positions_textbox, imgs.get('text_positions'))
+            _set_textbox_text(self.image_line_spacing_options_textbox, imgs.get('line_spacing_options'))
+            _set_textbox_text(self.image_zoom_crop_percentages_textbox, imgs.get('zoom_crop_percentages'))
+            if imgs.get('allow_flip'):
+                self.image_flip_switch.select()
+            else:
+                self.image_flip_switch.deselect()
+            if imgs.get('no_background'):
+                self.image_no_bg_switch.select()
+            else:
+                self.image_no_bg_switch.deselect()
 
-        # 加载 AB图文 设置
+        # --- 4. 加载其他模块的参数 ---
         ab_s = settings.get('ab_image_settings', {})
-        self.ab_num_groups_entry.delete(0, 'end')
-        self.ab_num_groups_entry.insert(0, ab_s.get('num_groups', '10'))
+        if ab_s:
+            _set_entry_text(self.ab_num_groups_entry, ab_s.get('num_groups', '10'))
 
-        # 加载 长视频分割 设置
         splitter_s = settings.get('video_splitter_settings', {})
-        self.splitter_duration_entry.delete(0, 'end')
-        self.splitter_duration_entry.insert(0, splitter_s.get('duration', '3'))
-        if splitter_s.get('use_gpu', 0):
-            self.splitter_use_gpu_switch.select()
-        else:
-            self.splitter_use_gpu_switch.deselect()
+        if splitter_s:
+            _set_entry_text(self.splitter_duration_entry, splitter_s.get('duration', '3'))
+            if splitter_s.get('use_gpu'):
+                self.splitter_use_gpu_switch.select()
+            else:
+                self.splitter_use_gpu_switch.deselect()
 
-        # 加载 视频截图片 设置
         extractor_s = settings.get('frame_extractor_settings', {})
-        self.extractor_interval_entry.delete(0, 'end')
-        self.extractor_interval_entry.insert(0, extractor_s.get('interval', '3'))
-        if extractor_s.get('resize', 1):
-            self.extractor_resize_switch.select()
-        else:
-            self.extractor_resize_switch.deselect()
-
-
+        if extractor_s:
+            _set_entry_text(self.extractor_interval_entry, extractor_s.get('interval', '3'))
+            if extractor_s.get('resize', 1):
+                self.extractor_resize_switch.select()
+            else:
+                self.extractor_resize_switch.deselect()
     def _update_color_widget(self, attr_name, color_value): setattr(self, attr_name + "_value", color_value); button = getattr(self, attr_name + "_button"); button.configure(text=str(color_value), fg_color="gray" if "rgba" in str(color_value) else color_value)
 
 # ==============================================================================
