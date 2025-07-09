@@ -1149,7 +1149,8 @@ class App(ctk.CTk):
             config = self.get_video_config_from_gui()
             if not config: self.after(0, self._reset_video_buttons); return
 
-            video_folder, output_folder = self.video_folder_entry.get(), self.video_output_folder_entry.get()
+            video_folder = self.video_folder_entry.get()
+            output_folder = self.video_output_folder_entry.get()
             all_input_text = self.video_text_input_box.get("1.0", "end-1c")
             use_gpu = self.video_use_gpu_switch.get() == 1
             is_remix_mode = self.video_random_remix_switch.get() == 1
@@ -1169,38 +1170,31 @@ class App(ctk.CTk):
                 self.log_video("错误: 视频文件夹中没有任何视频文件。");
                 return
 
-            if os.path.exists(output_folder): shutil.rmtree(output_folder)
-            os.makedirs(output_folder)
-
+            # --- 统一的模式判断与预检逻辑 ---
             group_names = []
-            if is_remix_mode:
-                self.log_video("🚀 已激活【随机混剪】模式。")
-                if not durations_list or len(durations_list) != len(text_lines):
-                    self.log_video("错误: 在混剪模式下，'视频时长秒'必须填写，且数量必须与文案行数一致。");
-                    self.after(0, self._reset_video_buttons);
-                    return
-                group_names = [f"remix_{i + 1}" for i in range(len(text_lines))]
+            num_groups_str = self.video_num_groups_entry.get().strip()
+            phone_serials_str = self.video_phone_serial_entry.get().strip()
+            if phone_serials_str:
+                group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
+                if not group_names: self.log_video("错误: 手机序号输入无效。"); self.after(0,
+                                                                                          self._reset_video_buttons); return
+                self.log_video(f"手机序号模式激活，将创建 {len(group_names)} 个指定名称的文件夹。")
+            elif num_groups_str:
+                try:
+                    num_groups = self._safe_int_convert(num_groups_str, 0)
+                    if num_groups <= 0: raise ValueError
+                    group_names = [f"group_{i + 1}" for i in range(num_groups)]
+                    self.log_video(f"组数模式激活，将创建 {len(group_names)} 个文件夹。")
+                except ValueError:
+                    self.log_video("错误: '生成组数' 必须是一个有效的正整数。"); self.after(0,
+                                                                                           self._reset_video_buttons); return
             else:
-                self.log_video("🚀 已激活【顺序处理】模式。")
-                num_groups_str = self.video_num_groups_entry.get().strip()
-                phone_serials_str = self.video_phone_serial_entry.get().strip()
-                if phone_serials_str:
-                    group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
-                    if not group_names: self.log_video("错误: 手机序号输入无效。"); self.after(0,
-                                                                                              self._reset_video_buttons); return
-                elif num_groups_str:
-                    try:
-                        num_groups = self._safe_int_convert(num_groups_str, 0)
-                        if num_groups <= 0: raise ValueError
-                        group_names = [f"group_{i + 1}" for i in range(num_groups)]
-                    except ValueError:
-                        self.log_video("错误: '生成组数' 必须是一个有效的正整数。"); self.after(0,
-                                                                                               self._reset_video_buttons); return
-                else:
-                    self.log_video("错误: '生成组数' 或 '手机序号' 必须填写一个。");
-                    self.after(0, self._reset_video_buttons);
-                    return
+                self.log_video("错误: '生成组数' 或 '手机序号' 必须填写一个。");
+                self.after(0, self._reset_video_buttons);
+                return
 
+            # 只有在顺序模式下，才需要严格检查视频数量
+            if not is_remix_mode:
                 total_videos_needed = len(group_names) * len(text_lines)
                 if len(all_original_videos) < total_videos_needed:
                     self.log_video(
@@ -1208,8 +1202,13 @@ class App(ctk.CTk):
                     self.after(0, self._reset_video_buttons);
                     return
 
-            random.shuffle(all_original_videos)
+            if os.path.exists(output_folder): shutil.rmtree(output_folder)
+            os.makedirs(output_folder)
 
+            random.shuffle(all_original_videos)
+            video_pool = list(all_original_videos)
+
+            # --- 核心修复：统一的主处理循环 ---
             for idx, group_name in enumerate(group_names):
                 if self.video_stop_event.is_set(): break
 
@@ -1217,40 +1216,53 @@ class App(ctk.CTk):
                 os.makedirs(group_folder, exist_ok=True)
                 self.log_video(f"\n---=== 开始处理组: {group_name} ===---")
 
-                if is_remix_mode:
-                    target_duration = durations_list[idx]
-                    text_line = text_lines[idx]
+                # 内层循环，遍历每一行文案
+                for j, text_line in enumerate(text_lines):
+                    if self.video_stop_event.is_set(): break
 
-                    # _create_random_remix_clip 现在返回两个值
-                    remix_clip_path, temp_files_from_remix = self._create_random_remix_clip(target_duration,
-                                                                                            all_original_videos,
-                                                                                            group_folder,
-                                                                                            self.log_video)
+                    input_video_path = None
+                    temp_files_for_this_task = []
+                    is_current_task_remix = False
 
-                    if remix_clip_path:
-                        # --- 核心修复：将所有临时文件统一传递给下一步进行处理和清理 ---
-                        all_temp_files_for_this_task = temp_files_from_remix + [remix_clip_path]
-                        self._apply_text_to_video(remix_clip_path, group_folder, f"remix_{group_name}.mp4", text_line,
-                                                  config, use_gpu, all_temp_files_for_this_task)
+                    if is_remix_mode:
+                        # 混剪模式：为当前文案动态生成一个混剪视频
+                        if j >= len(durations_list):
+                            self.log_video(f"  -> 警告: 时长列表数量少于文案行数，第 {j + 1} 条文案缺少对应时长，已跳过。")
+                            continue
+                        target_duration = durations_list[j] + 1
+                        input_video_path, temp_files_from_remix = self._create_random_remix_clip(target_duration,
+                                                                                                 video_pool,
+                                                                                                 group_folder,
+                                                                                                 self.log_video)
+                        if not input_video_path:
+                            self.log_video(f"  ❌ 错误: 为文案 '{text_line[:10]}...' 创建混剪视频失败，跳过此任务。")
+                            continue
+                        temp_files_for_this_task.extend(temp_files_from_remix)
+                        temp_files_for_this_task.append(input_video_path)  # 混剪出的视频也是临时文件
+                        is_current_task_remix = True
                     else:
-                        self.log_video("  ❌ 错误: 创建混剪视频失败，跳过此任务。")
-                        # 即使失败，也要清理掉可能产生的临时文件
-                        for f in temp_files_from_remix:
-                            if os.path.exists(f): os.remove(f)
+                        # 顺序模式：按顺序取一个视频
+                        video_index = idx * len(text_lines) + j
+                        input_video_path = video_pool[video_index]
 
-                else:  # 顺序处理模式
-                    start_index = idx * len(text_lines)
-                    end_index = start_index + len(text_lines)
-                    video_chunk = all_original_videos[start_index:end_index]
-                    for j, video_path in enumerate(video_chunk):
-                        if self.video_stop_event.is_set(): break
-                        text_line = text_lines[j]
-                        # 传递一个空的列表，因为原视频不需要被删除
-                        self._apply_text_to_video(video_path, group_folder, os.path.basename(video_path), text_line,
-                                                  config, use_gpu, [])
+                    # 准备时长参数
+                    duration_param = ""
+                    if durations_list and not is_remix_mode:
+                        current_duration = durations_list[j % len(durations_list)]
+                        if current_duration > 0:
+                            adjusted_duration = current_duration + 1
+                            duration_param = f"-to {adjusted_duration}"
+                            self.log_video(f"  -> 将应用时长: {adjusted_duration}s")
+
+                    # 统一调用处理函数
+                    output_name = f"{group_name}_{j + 1}.mp4"
+                    self._apply_text_to_video(input_video_path, group_folder, output_name, text_line, config, use_gpu,
+                                              duration_param, temp_files_for_this_task)
+
+                    if not is_remix_mode:  # 顺序模式下才删除原始视频
                         try:
-                            os.remove(video_path)
-                            self.log_video(f"  -> ✅ 源视频已删除: {os.path.basename(video_path)}")
+                            os.remove(input_video_path)
+                            self.log_video(f"  -> ✅ 源视频已删除: {os.path.basename(input_video_path)}")
                         except OSError as e:
                             self.log_video(f"  -> ❌ 删除源视频时发生异常: {e}")
 
@@ -1261,25 +1273,25 @@ class App(ctk.CTk):
             traceback.print_exc()
         finally:
             self.after(0, self._reset_video_buttons)
+
     def _apply_text_to_video(self, input_video_path, group_folder, video_name, text_line, config, use_gpu,
-                             temp_files_to_delete):
-        """【最终修正版】将原有的单个视频处理逻辑封装起来，并修复滤镜链构建错误"""
+                             duration_param, temp_files_to_delete):
+        """【最终修正版】将原有的单个视频处理逻辑封装起来，并修复所有已知错误"""
         output_video_path = os.path.join(group_folder, f"processed_{os.path.splitext(video_name)[0]}.mp4")
         self.log_video(f"\n- 正在处理: {os.path.basename(input_video_path)}")
 
         overlay_pngs_info = []
         try:
-            # 预处理视频方向 (这部分不变)
-            corrected_video_path, temp_video_file = self._preprocess_video_orientation(input_video_path, group_folder,
-                                                                                       self.log_video)
-            if temp_video_file:
-                temp_files_to_delete.append(temp_video_file)
+            corrected_video_path, temp_orientation_file = self._preprocess_video_orientation(input_video_path,
+                                                                                             group_folder,
+                                                                                             self.log_video)
+            if temp_orientation_file:
+                temp_files_to_delete.append(temp_orientation_file)
 
             if not corrected_video_path:
                 self.log_video(f"  -> 预处理失败，跳过视频。")
                 return
 
-            # 解析文案并生成所有PNG图片 (这部分不变)
             text_parts = [p.strip() for p in text_line.split('&') if p.strip()]
             if text_parts:
                 self.log_video("  -> 步骤1: 使用MoviePy生成高质量叠加图片...")
@@ -1291,54 +1303,36 @@ class App(ctk.CTk):
                     if not size: raise ValueError(f"文案块 {k + 1} 图片生成失败")
                     overlay_pngs_info.append({'path': png_path, 'size': size, 'config': part_config})
 
-            # --- 核心修复：构建正确的FFmpeg命令 ---
-            safe_ffmpeg_path = str(self._find_executable("ffmpeg")).replace('\\', '/')
-            safe_corrected_video_path = str(corrected_video_path).replace('\\', '/')
-            safe_output_path = str(output_video_path).replace('\\', '/')
+            safe_ffmpeg_path = f'"{os.path.normpath(self._find_executable("ffmpeg"))}"'
+            safe_corrected_video_path = f'"{os.path.normpath(corrected_video_path)}"'
+            safe_output_path = f'"{os.path.normpath(output_video_path)}"'
 
-            ffmpeg_inputs = [f'-i "{safe_corrected_video_path}"']
+            ffmpeg_inputs = [f'-i {safe_corrected_video_path}']
             for png_info in overlay_pngs_info:
-                safe_png_path = str(png_info['path']).replace('\\', '/')
-                ffmpeg_inputs.append(f'-i "{safe_png_path}"')
+                ffmpeg_inputs.append(f'-i "{os.path.normpath(png_info["path"])}"')
 
             if not overlay_pngs_info:
-                command_string = f'"{safe_ffmpeg_path}" -y -i "{safe_corrected_video_path}" -c copy "{safe_output_path}"'
+                command_string = f'{safe_ffmpeg_path} -y -i {safe_corrected_video_path} -c copy {safe_output_path}'
             else:
-                filter_chains = []
-                last_stream = "[0:v]"
-                last_y, last_h = 0, 0
-
+                filter_chains, last_stream, last_y, last_h = [], "[0:v]", 0, 0
                 for k, png_info in enumerate(overlay_pngs_info):
                     size, part_config = png_info['size'], png_info['config']
-
-                    if k == 0:
-                        y_pos = part_config['位置']['垂直位置 (y)']
-                        x_pos_val = part_config['位置']['水平位置 (x)']
-                    else:
-                        y_pos = last_y + last_h + part_config['相对Y轴偏移']
-                        x_pos_val = 'center'
-
+                    y_pos = part_config['位置']['垂直位置 (y)'] if k == 0 else last_y + last_h + part_config[
+                        '相对Y轴偏移']
+                    x_pos_val = part_config['位置']['水平位置 (x)'] if k == 0 else 'center'
                     x_pos = "(W-w)/2" if str(x_pos_val) == 'center' else str(x_pos_val)
-
-                    # 确定输出流的名称
-                    is_last_overlay = (k == len(overlay_pngs_info) - 1)
-                    output_tag = "[v_out]" if is_last_overlay else f"[v{k + 1}]"
-
-                    # 构建滤镜链，输入是上一个流，输出是新的流
+                    output_tag = "[v_out]" if k == len(overlay_pngs_info) - 1 else f"[v{k + 1}]"
                     filter_chains.append(f"{last_stream}[{k + 1}:v]overlay={x_pos}:{y_pos}{output_tag}")
-
-                    # 更新下一个滤镜的输入流名称
-                    last_stream = f"[v{k + 1}]"
-                    last_y, last_h = y_pos, size[1]
+                    last_stream, last_y, last_h = f"[v{k + 1}]", y_pos, size[1]
 
                 filter_complex_string = ";".join(filter_chains)
                 output_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
-                command_string = f'"{safe_ffmpeg_path}" -y {" ".join(ffmpeg_inputs)} -filter_complex "{filter_complex_string}" -map "[v_out]" -map 0:a? -c:v {output_codec} -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart "{safe_output_path}"'
+                command_string = f'{safe_ffmpeg_path} -y {" ".join(ffmpeg_inputs)} {duration_param} -filter_complex "{filter_complex_string}" -map "[v_out]" -map 0:a? -c:v {output_codec} -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart {safe_output_path}'
 
             self.log_video(f"  -> 步骤2: 使用FFmpeg高速合成...");
             creation_flags = 0
             if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
-            subprocess.run(command_string, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8',
                            creationflags=creation_flags)
             self.log_video(f"  -> 成功! 输出文件: {os.path.basename(output_video_path)}")
 
@@ -1353,6 +1347,7 @@ class App(ctk.CTk):
                         os.remove(f)
                     except OSError:
                         pass
+
     def _freeze_worker(self, ffmpeg, ffprobe, input_path, output_path, freeze_duration, temp_folder):
         try:
             if not ffprobe:
@@ -1427,6 +1422,18 @@ class App(ctk.CTk):
         except Exception as e:
             self.log_composite(f"  ❌ [定格] 处理中发生未知错误: {e}")
             return False
+        finally:
+            # --- 核心修复：在这里统一清理所有临时文件 ---
+            if last_frame_img and os.path.exists(last_frame_img):
+                try:
+                    os.remove(last_frame_img)
+                except OSError as e:
+                    self.log_composite(f"  -> 警告: 清理临时帧图片失败: {e}")
+            if freeze_video_clip and os.path.exists(freeze_video_clip):
+                try:
+                    os.remove(freeze_video_clip)
+                except OSError as e:
+                    self.log_composite(f"  -> 警告: 清理临时定格视频失败: {e}")
     def log_composite(self, message, clear=False):
         self.after(0, self._update_log, self.composite_log_textbox, message, clear)
 
@@ -1449,12 +1456,6 @@ class App(ctk.CTk):
         settings_frame.pack(fill="x", pady=(15, 5), ipady=10)
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(settings_frame, text="高级抠图设置 (FFmpeg)", font=ctk.CTkFont(weight="bold")).grid(row=0,
-                                                                                                         column=0,
-                                                                                                         columnspan=2,
-                                                                                                         padx=10,
-                                                                                                         pady=(5, 10),
-                                                                                                         sticky="w")
 
         calibrate_button = ctk.CTkButton(settings_frame, text="校准颜色 (推荐)", command=self.composite_calibrate_color)
         calibrate_button.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
@@ -1482,22 +1483,27 @@ class App(ctk.CTk):
         self.gs_composite_quality_slider = ctk.CTkSlider(settings_frame, from_=18, to=30, number_of_steps=12)
         self.gs_composite_quality_slider.set(24)
         self.gs_composite_quality_slider.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(settings_frame, text="<--更高质量/文件大 | 更小文件/质量略低-->", text_color="gray",
-                     font=("", 10)).grid(row=6, column=1, sticky="n")
 
+        # --- 新增：使用绿幕音频开关 ---
+        self.gs_composite_use_gs_audio_switch = ctk.CTkSwitch(settings_frame,
+                                                              text="使用绿幕视频的音频 (默认使用背景音频)")
+        self.gs_composite_use_gs_audio_switch.grid(row=7, column=0, columnspan=2, padx=10, pady=(15, 5), sticky="w")
         self.gs_composite_gpu_switch = ctk.CTkSwitch(settings_frame, text="启用GPU加速编码")
-        self.gs_composite_gpu_switch.grid(row=7, column=0, padx=10, pady=(15, 5), sticky="w")
+        self.gs_composite_gpu_switch.grid(row=8, column=0, padx=10, pady=(15, 5), sticky="w")
         if not self.is_gpu_available:
             self.gs_composite_gpu_switch.configure(state="disabled")
 
         self.composite_freeze_switch = ctk.CTkSwitch(settings_frame, text="开启结尾定格")
-        self.composite_freeze_switch.grid(row=8, column=0, padx=10, pady=(10, 5), sticky="w")
+        self.composite_freeze_switch.grid(row=9, column=0, padx=10, pady=(10, 5), sticky="w")
         freeze_entry_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        freeze_entry_frame.grid(row=8, column=1, sticky="w", padx=10, pady=(10, 5))
+        freeze_entry_frame.grid(row=10, column=1, sticky="w", padx=10, pady=(10, 5))
         ctk.CTkLabel(freeze_entry_frame, text="定格时长(秒):").pack(side="left")
         self.composite_freeze_duration_entry = ctk.CTkEntry(freeze_entry_frame, width=60)
         self.composite_freeze_duration_entry.insert(0, "3")
         self.composite_freeze_duration_entry.pack(side="left", padx=5)
+
+        self.gs_composite_ghost_freeze_switch = ctk.CTkSwitch(settings_frame, text="开启幽灵定格 (画面定格，音频填充)")
+        self.gs_composite_ghost_freeze_switch.grid(row=9, column=0, columnspan=2, padx=10, pady=(5, 10), sticky="w")
 
         button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         button_frame.pack(fill="x", pady=(15, 5))
@@ -1749,8 +1755,58 @@ class App(ctk.CTk):
                     video_files.append(os.path.join(root, file))
         return video_files
 
+    def _ghost_freeze_worker(self, ffmpeg, ffprobe, input_path, output_path, freeze_duration):
+        """【最终修正版】忠实地实现用户提供的“幽灵定格”逻辑，以音频时长驱动视频定格"""
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
 
+            safe_ffmpeg = f'"{os.path.normpath(ffmpeg)}"'
+            safe_ffprobe = f'"{os.path.normpath(ffprobe)}"'
+            safe_input_path = f'"{os.path.normpath(input_path)}"'
+            safe_output_path = f'"{os.path.normpath(output_path)}"'
 
+            # 1. 获取原视频的时长
+            cmd_probe_duration_str = f'{safe_ffprobe} -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {safe_input_path}'
+            result = subprocess.run(cmd_probe_duration_str, shell=True, check=True, capture_output=True, text=True,
+                                    creationflags=creation_flags)
+            original_duration = float(result.stdout.strip())
+
+            # 2. 计算最终的目标总时长
+            target_duration = original_duration + freeze_duration
+
+            # 3. 检查是否存在音频流
+            cmd_probe_audio_str = f'{safe_ffprobe} -v error -select_streams a -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 {safe_input_path}'
+            audio_result = subprocess.run(cmd_probe_audio_str, shell=True, check=True, capture_output=True, text=True,
+                                          creationflags=creation_flags)
+            has_audio = bool(audio_result.stdout.strip())
+
+            command_string = ""
+            if has_audio:
+                self.log_composite(f"  -> [幽灵定格] 检测到音频，使用apad填充至 {target_duration:.2f}s...")
+                # 核心逻辑：使用apad滤镜将音频[0:a]填充到目标总时长，视频流(-c:v copy)直接复制
+                # FFmpeg会自动用视频最后一帧填充多出来的时长
+                filter_complex = f'"[0:a]apad,atrim=0:{target_duration}[a_padded]"'
+                command_string = f'{safe_ffmpeg} -y -i {safe_input_path} -filter_complex {filter_complex} -map 0:v -map "[a_padded]" -c:v copy -c:a aac {safe_output_path}'
+            else:
+                self.log_composite(f"  -> [幽灵定格] 未检测到音频，创建 {target_duration:.2f}s 的静音音轨...")
+                # 核心逻辑：创建一个指定长度的虚拟静音源，与原始视频流合并
+                command_string = f'{safe_ffmpeg} -y -i {safe_input_path} -f lavfi -t {target_duration} -i anullsrc=r=44100:cl=stereo -map 0:v -map 1:a -c:v copy -c:a aac -shortest {safe_output_path}'
+
+            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8',
+                           creationflags=creation_flags)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            self.log_composite(f"  ❌ [幽灵定格] FFmpeg处理失败:\n{e.stderr.strip()}")
+            return False
+        except Exception as e:
+            self.log_composite(f"  ❌ [幽灵定格] 处理中发生未知错误: {e}")
+            return False
+        finally:
+            # 这个函数只负责生成最终文件，临时文件的清理由调用它的 run_composite_logic 负责
+            pass
     def start_composite_processing(self):
         self.composite_start_button.configure(state="disabled")
         self.composite_stop_button.configure(state="normal")
@@ -1837,45 +1893,46 @@ class App(ctk.CTk):
         cv2.destroyAllWindows()
 
     def run_composite_logic(self):
-        """【最终版】绿幕合成 (恢复颜色校准 + 智能分辨率匹配 + despill)"""
+        """【最终完整版】绿幕合成 (集成了所有修复和优化)"""
         try:
+            # 1. --- 获取所有UI配置 ---
             source_folder = self.gs_composite_source_folder_entry.get()
             bg_folder = self.gs_composite_bg_folder_entry.get()
             output_folder = self.gs_composite_output_folder_entry.get()
 
-            # --- 核心修复：优先使用校准后的颜色，否则使用默认的绿色 ---
-            key_color_hex = self.selected_hex_color if self.selected_hex_color else "#00FF00"
-            key_color_for_ffmpeg = key_color_hex.lstrip('#')
-
+            key_color = (self.selected_hex_color if self.selected_hex_color else "#00FF00").lstrip('#')
             similarity = self.gs_composite_similarity_slider.get()
             blend = self.gs_composite_blend_slider.get()
             despill_amount = self.gs_composite_despill_slider.get()
             quality_val = int(self.gs_composite_quality_slider.get())
             use_gpu = self.gs_composite_gpu_switch.get() == 1 and self.is_gpu_available
+            use_gs_audio = self.gs_composite_use_gs_audio_switch.get() == 1
             do_freeze = self.composite_freeze_switch.get() == 1
-            freeze_duration = float(self.composite_freeze_duration_entry.get()) if do_freeze else 0
+            do_ghost_freeze = self.gs_composite_ghost_freeze_switch.get() == 1
+            freeze_duration = self._safe_float_convert(self.composite_freeze_duration_entry.get(), 0) if (
+                        do_freeze or do_ghost_freeze) else 0
 
             if not all([source_folder, bg_folder, output_folder]):
-                self.log_composite("❌ 错误: 所有文件夹路径都必须选择！")
+                self.log_composite("❌ 错误: 所有文件夹路径都必须选择！");
                 return
 
             source_videos = self._composite_get_video_files(source_folder)
             background_videos = self._composite_get_video_files(bg_folder)
 
             if not source_videos or not background_videos:
-                self.log_composite("❌ 错误: 绿幕文件夹或背景文件夹中没有找到视频文件。")
+                self.log_composite("❌ 错误: 绿幕文件夹或背景文件夹中没有找到视频文件。");
                 return
 
             ffmpeg_path = self._find_executable("ffmpeg")
             ffprobe_path = self._find_executable("ffprobe")
             if not ffmpeg_path or not ffprobe_path:
-                self.log_composite("❌ 错误: 找不到 ffmpeg.exe 或 ffprobe.exe")
+                self.log_composite("❌ 错误: 找不到 ffmpeg.exe 或 ffprobe.exe");
                 return
 
             mode = "GPU加速" if use_gpu else "CPU"
-            self.log_composite(
-                f"🚀 已切换至FFmpeg {mode}模式。颜色:{key_color_hex}, 相似度:{similarity:.2f}, 羽化:{blend:.2f}, 去绿边:{despill_amount:.2f}, 质量:{quality_val}")
+            self.log_composite(f"🚀 已切换至FFmpeg {mode}模式。质量(CRF/CQ): {quality_val}")
 
+            # 2. --- 主处理循环 ---
             total_tasks = len(source_videos) * len(background_videos)
             task_count = 0
 
@@ -1888,20 +1945,31 @@ class App(ctk.CTk):
                     self.log_composite(f"  背景: {os.path.basename(bg_path)}")
                     self.log_composite(f"  绿幕: {os.path.basename(src_path)}")
 
+                    relative_path = os.path.relpath(os.path.dirname(src_path), source_folder)
+                    output_subfolder = os.path.join(output_folder, relative_path)
+                    os.makedirs(output_subfolder, exist_ok=True)
+                    src_basename = os.path.splitext(os.path.basename(src_path))[0]
+                    bg_basename = os.path.splitext(os.path.basename(bg_path))[0]
+                    output_filename = f"{src_basename}_on_{bg_basename}.mp4"
+                    output_filepath = os.path.join(output_subfolder, output_filename)
+
                     try:
                         creation_flags = 0
                         if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
 
-                        cmd_probe_bg = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries",
-                                        "stream=width,height", "-of", "csv=p=0", os.path.normpath(bg_path)]
-                        bg_res_str = subprocess.run(cmd_probe_bg, check=True, capture_output=True, text=True,
-                                                    creationflags=creation_flags).stdout.strip()
+                        # --- 2a. 智能分辨率匹配 ---
+                        safe_ffprobe_path = f'"{os.path.normpath(ffprobe_path)}"'
+                        safe_bg_path = f'"{os.path.normpath(bg_path)}"'
+                        safe_src_path = f'"{os.path.normpath(src_path)}"'
+
+                        cmd_probe_bg_str = f'{safe_ffprobe_path} -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 {safe_bg_path}'
+                        bg_res_str = subprocess.run(cmd_probe_bg_str, shell=True, check=True, capture_output=True,
+                                                    text=True, creationflags=creation_flags).stdout.strip()
                         bg_w, bg_h = map(int, bg_res_str.split(','))
 
-                        cmd_probe_src = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries",
-                                         "stream=width,height", "-of", "csv=p=0", os.path.normpath(src_path)]
-                        src_res_str = subprocess.run(cmd_probe_src, check=True, capture_output=True, text=True,
-                                                     creationflags=creation_flags).stdout.strip()
+                        cmd_probe_src_str = f'{safe_ffprobe_path} -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 {safe_src_path}'
+                        src_res_str = subprocess.run(cmd_probe_src_str, shell=True, check=True, capture_output=True,
+                                                     text=True, creationflags=creation_flags).stdout.strip()
                         src_w, src_h = map(int, src_res_str.split(','))
 
                         target_w, target_h = max(bg_w, src_w), max(bg_h, src_h)
@@ -1909,52 +1977,55 @@ class App(ctk.CTk):
                         if bg_w != src_w or bg_h != src_h:
                             self.log_composite(f"  -> 检测到分辨率不匹配。将统一到 {target_w}x{target_h} 进行合成。")
 
-                        filters = []
-                        filters.append(
-                            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2[bg]")
-                        filters.append(
-                            f"[1:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2[src]")
-                        filters.append(
-                            f"[src]chromakey=0x{key_color_for_ffmpeg}:{similarity:.2f}:{blend:.2f}[keyed_fg]")
-                        filters.append(f"[keyed_fg]despill=type=green:mix={despill_amount:.2f}[clean_fg]")
-                        filters.append(f"[bg][clean_fg]overlay[v]")
+                        # --- 2b. 构建FFmpeg命令字符串 ---
+                        filters = [
+                            f"[0:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2[bg]",
+                            f"[1:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2[src]",
+                            f"[src]chromakey=0x{key_color}:{similarity:.2f}:{blend:.2f}[keyed_fg]",
+                            f"[keyed_fg]despill=type=green:mix={despill_amount:.2f}[clean_fg]",
+                            f"[bg][clean_fg]overlay[v]"
+                        ]
                         filter_complex = ";".join(filters)
+                        safe_output_path = f'"{os.path.normpath(output_filepath)}"'
 
-                        relative_path = os.path.relpath(os.path.dirname(src_path), source_folder)
-                        output_subfolder = os.path.join(output_folder, relative_path)
-                        os.makedirs(output_subfolder, exist_ok=True)
-                        src_basename, bg_basename = os.path.splitext(os.path.basename(src_path))[0], \
-                        os.path.splitext(os.path.basename(bg_path))[0]
-                        output_filename = f"{src_basename}_on_{bg_basename}.mp4"
-                        output_filepath = os.path.join(output_subfolder, output_filename)
-
-                        command = [ffmpeg_path, '-y', '-i', os.path.normpath(bg_path), '-i', os.path.normpath(src_path),
-                                   '-filter_complex', filter_complex, '-map', '[v]', '-map', '0:a?', '-shortest']
-
-                        if use_gpu:
-                            command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', str(quality_val)])
+                        audio_map_str = '-map 1:a?' if use_gs_audio else '-map 0:a?'
+                        if use_gs_audio:
+                            self.log_composite("  -> 已选择使用【绿幕视频】的音频。")
                         else:
-                            command.extend(['-c:v', 'libx264', '-preset', 'medium', '-crf', str(quality_val)])
+                            self.log_composite("  -> 使用【背景视频】的音频。")
 
-                        command.append(output_filepath)
+                        codec_str = f"-c:v h264_nvenc -preset fast -cq {quality_val}" if use_gpu else f"-c:v libx264 -preset medium -crf {quality_val}"
 
-                        subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8',
-                                       creationflags=creation_flags)
+                        command_string = f'"{ffmpeg_path}" -y -i {safe_bg_path} -i {safe_src_path} -filter_complex "{filter_complex}" -map "[v]" {audio_map_str} -shortest {codec_str} {safe_output_path}'
+
+                        subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True,
+                                       encoding='utf-8', creationflags=creation_flags)
                         self.log_composite(f"  ✅ 成功合成: {output_filename}")
 
-                        if do_freeze and freeze_duration > 0:
-                            self.log_composite(f"  -> 正在添加 {freeze_duration}秒 结尾定格...")
+                        # --- 2c. 核心修复：合成成功后，立刻检查是否需要添加定格 ---
+                        if (do_freeze or do_ghost_freeze) and freeze_duration > 0:
                             temp_output_path = os.path.join(output_subfolder, f"temp_{output_filename}")
                             os.rename(output_filepath, temp_output_path)
-                            freeze_success = self._freeze_worker(ffmpeg_path, ffprobe_path, temp_output_path,
-                                                                 output_filepath, freeze_duration, output_subfolder)
+
+                            freeze_success = False
+                            if do_ghost_freeze:
+                                self.log_composite(f"  -> 模式: 幽灵定格 ({freeze_duration}秒)")
+                                freeze_success = self._ghost_freeze_worker(ffmpeg_path, ffprobe_path, temp_output_path,
+                                                                           output_filepath, freeze_duration)
+                            else:
+                                self.log_composite(f"  -> 模式: 普通定格 ({freeze_duration}秒)")
+                                freeze_success = self._freeze_worker(ffmpeg_path, ffprobe_path, temp_output_path,
+                                                                     output_filepath, freeze_duration, output_subfolder)
+
                             if freeze_success:
                                 self.log_composite("  -> ✅ 定格添加成功。")
                             else:
                                 self.log_composite("  -> ❌ 定格添加失败，已保留未定格视频。")
                                 os.rename(temp_output_path, output_filepath)
+
                             if os.path.exists(temp_output_path):
                                 os.remove(temp_output_path)
+                        # --- 修复结束 ---
 
                     except subprocess.CalledProcessError as e:
                         self.log_composite(f"  ❌ FFmpeg 处理失败:\n{e.stderr.strip()}")
@@ -1966,8 +2037,10 @@ class App(ctk.CTk):
 
         except Exception as e:
             self.log_composite(f"发生未预料的严重错误: {e}")
+            traceback.print_exc()
         finally:
             self.after(0, self._reset_composite_buttons)
+
     # ==============================================================================
     # --- 加滤镜 (新功能) ---
     # ==============================================================================
@@ -2816,7 +2889,7 @@ class App(ctk.CTk):
 
     def _cut_process_video(self, ffmpeg_path, input_path, output_path, start_time, end_time, jump_time):
         """
-        【最终版】使用FFmpeg处理单个视频的跳剪，并兼容有声/无声视频。
+        【新版】完全采纳用户提供的脚本逻辑来处理单个视频的跳剪。
         """
         if not os.path.exists(input_path):
             self.log_cut(f"错误: 找不到输入视频文件: {input_path}")
@@ -2831,66 +2904,42 @@ class App(ctk.CTk):
                 return False
 
         self.log_cut(f"\n信息: === 开始处理视频: '{os.path.basename(input_path)}' ===")
-        self.log_cut(f"  将保留 {start_time:.2f}s 到 {end_time:.2f}s, 然后跳转到 {jump_time:.2f}s 继续。")
+        self.log_cut(f"  将保留视频从 {start_time:.2f} 秒到 {end_time:.2f} 秒，")
+        self.log_cut(f"  然后跳转并拼接从 {jump_time:.2f} 秒开始到末尾的内容。")
 
-        ffprobe_path = self._find_executable("ffprobe")
-        if not ffprobe_path:
-            self.log_cut("  -> 错误: 找不到ffprobe.exe, 无法检查音频，已跳过。")
-            return False
-
-        creation_flags = 0
-        if sys.platform == 'win32':
-            creation_flags = subprocess.CREATE_NO_WINDOW
-
-        cmd_probe_audio = [ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name",
-                           "-of", "default=noprint_wrappers=1:nokey=1", input_path]
-        try:
-            audio_result = subprocess.run(cmd_probe_audio, check=True, capture_output=True, text=True,
-                                          creationflags=creation_flags)
-            has_audio = bool(audio_result.stdout.strip())
-        except subprocess.CalledProcessError:
-            has_audio = False  # ffprobe失败也认为无音频
-
-        if has_audio:
-            self.log_cut("  -> 检测到音频流，将同时处理音视频。")
-            filter_complex_str = (
-                f"[0:v]trim=start={start_time}:end={end_time},setpts=PTS-STARTPTS[v1];"
-                f"[0:a]atrim=start={start_time}:end={end_time},asetpts=PTS-STARTPTS[a1];"
-                f"[0:v]trim=start={jump_time},setpts=PTS-STARTPTS[v2];"
-                f"[0:a]atrim=start={jump_time},asetpts=PTS-STARTPTS[a2];"
-                f"[v1][v2]concat=n=2:v=1:a=0[outv];"
-                f"[a1][a2]concat=n=2:v=0:a=1[outa]"
-            )
-            command = [
-                ffmpeg_path, "-hide_banner", "-loglevel", "error",
-                "-i", input_path, "-filter_complex", filter_complex_str,
-                "-map", "[outv]", "-map", "[outa]",
-                "-c:v", "libx264", "-preset", "medium",
-                "-c:a", "aac", "-y", output_path
-            ]
-        else:
-            self.log_cut("  -> 未检测到音频流，仅处理视频。")
-            filter_complex_str = (
-                f"[0:v]trim=start={start_time}:end={end_time},setpts=PTS-STARTPTS[v1];"
-                f"[0:v]trim=start={jump_time},setpts=PTS-STARTPTS[v2];"
-                f"[v1][v2]concat=n=2:v=1[outv]"
-            )
-            command = [
-                ffmpeg_path, "-hide_banner", "-loglevel", "error",
-                "-i", input_path, "-filter_complex", filter_complex_str,
-                "-map", "[outv]",
-                "-c:v", "libx264", "-preset", "medium",
-                "-an", "-y", output_path
-            ]
+        # --- 完全采纳自您提供的脚本 ---
+        filter_complex_str = (
+            f"[0:v]trim=start={start_time}:end={end_time},setpts=PTS-STARTPTS[v_initial];"
+            f"[0:v]trim=start={jump_time}[v_jumped];"
+            f"[0:a]atrim=start={start_time}:end={end_time},asetpts=PTS-STARTPTS[a_initial];"
+            f"[0:a]atrim=start={jump_time}[a_jumped];"
+            f"[v_initial][v_jumped]concat=n=2:v=1:a=0[out_v];"
+            f"[a_initial][a_jumped]concat=n=2:v=0:a=1[out_a]"
+        )
+        command = [
+            ffmpeg_path, "-hide_banner", "-loglevel", "error",
+            "-i", input_path,
+            "-filter_complex", filter_complex_str,
+            "-map", "[out_v]", "-map", "[out_a]",
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-c:a", "aac", "-strict", "-2",
+            "-y", output_path,
+        ]
+        # --- 逻辑结束 ---
 
         try:
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
             subprocess.run(command, check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                            encoding='utf-8', creationflags=creation_flags)
             self.log_cut(f"成功: 处理完成! 输出文件: {os.path.basename(output_path)}")
             return True
         except subprocess.CalledProcessError as e:
             self.log_cut(f"错误: FFmpeg 处理 '{os.path.basename(input_path)}' 失败。")
-            if e.stderr: self.log_cut(f"  FFmpeg 错误输出:\n{e.stderr.strip()}")
+            if e.stderr:
+                self.log_cut(f"  FFmpeg 错误输出:\n{e.stderr.strip()}")
             return False
         except Exception as e:
             self.log_cut(f"处理视频 '{os.path.basename(input_path)}' 时发生未知错误: {e}")
@@ -2922,26 +2971,17 @@ class App(ctk.CTk):
                 return
 
             try:
-                # --- 核心修改：获取输入值后，自动加1 ---
-                play_until_original = float(self.cut_play_until_entry.get())
-                resume_from_original = float(self.cut_resume_from_entry.get())
-
-                play_until = play_until_original + 1
-                resume_from = resume_from_original + 1
-
-                self.log_cut(
-                    f"信息: 输入时间已自动加1。播放到: {play_until_original:.2f}s -> {play_until:.2f}s, 跳转到: {resume_from_original:.2f}s -> {resume_from:.2f}s")
-
+                # 直接使用用户输入的原始值
+                play_until = float(self.cut_play_until_entry.get())
+                resume_from = float(self.cut_resume_from_entry.get())
                 if play_until < 0 or resume_from <= play_until:
                     raise ValueError("时间点设置无效。")
             except (ValueError, TypeError):
-                self.log_cut("错误: 时间点必须为有效数字，且跳转时间点必须大于播放时间点。")
+                self.log_cut("错误: 时间点必须为有效数字，且跳转时间点必须严格大于播放时间点。")
                 return
 
-            # 使用通用的 _find_executable 函数
-            ffmpeg_executable = self._find_executable("ffmpeg")
+            ffmpeg_executable = self._cut_find_ffmpeg_path(ffmpeg_path_user)
             if not ffmpeg_executable:
-                self.log_cut("错误: 找不到 FFmpeg。请确保已正确安装或放置在程序目录的ffmpeg文件夹内。")
                 return
 
             self.log_cut(f"---开始扫描并处理视频 (保留 0s-{play_until:.2f}s, 跳转到 {resume_from:.2f}s)---")
@@ -2949,12 +2989,17 @@ class App(ctk.CTk):
             found_count, processed_count = 0, 0
             video_extensions = ('.mp4', '.avi', '.mkv', '.mov', '.flv', '.wmv', '.mpeg', '.mpg')
 
-            # 采用您新脚本中的 os.walk 逻辑，遍历所有子文件夹
+            # 采纳您新脚本中的 os.walk 逻辑，遍历所有子文件夹
             for dirpath, _, filenames in os.walk(input_dir):
                 if self.cut_stop_event.is_set(): break
                 for filename in filenames:
                     if self.cut_stop_event.is_set(): break
-                    if not filename.lower().endswith(video_extensions): continue
+
+                    # 自动跳过已处理过的文件
+                    if "_processed" in filename:
+                        continue
+                    if not filename.lower().endswith(video_extensions):
+                        continue
 
                     found_count += 1
                     input_video_path = os.path.join(dirpath, filename)
@@ -3002,6 +3047,20 @@ class App(ctk.CTk):
         settings_frame.pack(fill="x", padx=5, pady=10)
         ctk.CTkLabel(settings_frame, text="2. 功能开关与偏移量", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5,0))
         self.create_widget_row(settings_frame, "预裁剪时长(秒):", "blur_crop_duration", "4", placeholder="0或留空则不裁剪")
+
+        # --- 核心修复：修改UI布局，分两行显示 ---
+        effects_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
+        effects_frame.pack(fill="x", padx=10, pady=5)
+
+        self.blur_mirror_switch = ctk.CTkSwitch(effects_frame, text="内容镜像")
+        self.blur_mirror_switch.pack(anchor="w", pady=(5, 10))
+
+        zoom_frame = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        zoom_frame.pack(fill="x")
+        ctk.CTkLabel(zoom_frame, text="内容放大倍数:", width=120, anchor="w").pack(side="left")
+        self.blur_zoom_entry = ctk.CTkEntry(zoom_frame, placeholder_text="例如: 1.2")
+        self.blur_zoom_entry.insert(0, "1.0")
+        self.blur_zoom_entry.pack(side="left", fill="x", expand=True)
 
         switches_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
         switches_frame.pack(fill="x", padx=10, pady=5)
@@ -3190,115 +3249,88 @@ class App(ctk.CTk):
         return np.array(bg_image)
 
     def _blur_process_video(self, input_path, output_path, use_gpu, content_roi, pip_roi, text_config, offsets,
-                            crop_duration=0):
-        """【最终健壮版 - FFmpeg核心 - 修正最终尺寸】"""
-        temp_pip_image_path = None
+                            crop_duration=0, mirror_content=False, zoom_factor=1.0):
+        """【最终健壮版】重构滤镜链，彻底解决 'unconnected' 错误"""
         temp_text_image_path = None
         try:
-            # --- 步骤 1 & 2: 准备并获取视频信息 (保留) ---
             ffmpeg_path = self._find_executable("ffmpeg")
-            if not ffmpeg_path: return False, "找不到 ffmpeg.exe"
             ffprobe_path = self._find_executable("ffprobe")
-            if not ffprobe_path: return False, "找不到 ffprobe.exe"
+            if not ffmpeg_path or not ffprobe_path: return False, "找不到 ffmpeg.exe 或 ffprobe.exe"
 
             self.log_blur("  -> 使用ffprobe获取视频信息...")
             norm_input_path = os.path.normpath(input_path)
             cmd_probe = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
                          "-of", "csv=p=0", norm_input_path]
-            result = subprocess.run(cmd_probe, check=True, capture_output=True, text=True, encoding='utf-8')
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(cmd_probe, check=True, capture_output=True, text=True, creationflags=creation_flags)
             video_w, video_h = map(int, result.stdout.strip().split(','))
-            self.log_blur(f"  -> 视频尺寸: {video_w}x{video_h}")
 
-            # --- 步骤 3: 准备静态图片图层 (保留) ---
             output_dir = os.path.dirname(output_path)
-            if pip_roi:
-                self.log_blur("  -> 正在生成PIP静态图层...")
-                px, py, pw, ph = pip_roi
-                first_frame_img = self._blur_get_frame_at_0(input_path)
-                if first_frame_img is not None and (py + ph <= first_frame_img.shape[0]) and (
-                        px + pw <= first_frame_img.shape[1]):
-                    pip_image_data = first_frame_img[py:py + ph, px:px + pw]
-                    temp_pip_image = Image.fromarray(pip_image_data)
-                    temp_pip_image_path = os.path.join(output_dir, f"temp_pip_{random.randint(1000, 9999)}.png")
-                    temp_pip_image.save(temp_pip_image_path)
-
             if text_config and text_config.get('text'):
                 self.log_blur("  -> 正在生成文字静态图层...")
-                text_img_array = self._blur_create_text_image(
-                    text_config['text'], text_config['box_w'], text_config['box_h'],
-                    text_config['font_path'], text_config['font_color'], text_config['bg_color'],
-                    text_config['corner_radius']
-                )
+                text_img_array = self._blur_create_text_image(text_config['text'], text_config['box_w'],
+                                                              text_config['box_h'], text_config['font_path'],
+                                                              text_config['font_color'], text_config['bg_color'],
+                                                              text_config['corner_radius'])
                 temp_text_image = Image.fromarray(text_img_array)
                 temp_text_image_path = os.path.join(output_dir, f"temp_text_{random.randint(1000, 9999)}.png")
                 temp_text_image.save(temp_text_image_path)
 
-            # --- 步骤 4: 构建修正后的 FFmpeg 命令 ---
             self.log_blur("  -> 正在构建FFmpeg滤镜链...")
             command = [ffmpeg_path, '-y']
             if crop_duration > 0:
                 command.extend(['-t', str(crop_duration)])
             command.extend(['-i', norm_input_path])
-            if temp_pip_image_path:
-                command.extend(['-i', os.path.normpath(temp_pip_image_path)])
             if temp_text_image_path:
                 command.extend(['-i', os.path.normpath(temp_text_image_path)])
 
             cx, cy, cw, ch = content_roi
-            y_offset_main, y_offset_pip, y_offset_text = offsets['main'], offsets['pip'], offsets['text']
+            y_offset_main, y_offset_text = offsets['main'], offsets['text']
 
+            # --- 核心逻辑修复：重构滤镜链 ---
             filters = []
-            filters.append("[0:v]split=2[original][to_process]")
+            filters.append("[0:v]split=2[fg_src][bg_src]")
 
-            # --- 核心逻辑修正 ---
-            # 在 scale 滤镜后加入了 setsar=1 来强制校正像素宽高比，确保画布尺寸正确
-            filters.append(
-                f"[to_process]crop={cw}:{ch}:{cx}:{cy},scale={video_w}:{video_h},setsar=1,gblur=sigma=50[blurred_bg]")
-            # --- 修正结束 ---
+            foreground_chain = f"[fg_src]crop={cw}:{ch}:{cx}:{cy}"
+            if zoom_factor > 1.0:
+                self.log_blur(f"  -> 应用放大: {zoom_factor:.2f}倍")
+                foreground_chain += f",scale=iw*{zoom_factor}:ih*{zoom_factor},crop={cw}:{ch}"
+            if mirror_content:
+                self.log_blur("  -> 应用内容镜像")
+                foreground_chain += ",hflip"
+            foreground_chain += "[sharp_fg]"
+            filters.append(foreground_chain)
 
-            filters.append(f"[original]crop={cw}:{ch}:{cx}:{cy}[sharp_fg]")
+            background_chain = f"[bg_src]crop={cw}:{ch}:{cx}:{cy}"
+            if zoom_factor > 1.0: background_chain += f",scale=iw*{zoom_factor}:ih*{zoom_factor},crop={cw}:{ch}"
+            if mirror_content: background_chain += ",hflip"
+            background_chain += f",scale={video_w}:{video_h},setsar=1,gblur=sigma=50[blurred_bg]"
+            filters.append(background_chain)
 
+            # 确定主合成的输出流名称
+            main_comp_output_tag = "[v_out]" if not temp_text_image_path else "[comp1]"
             main_fg_y = cy + y_offset_main
-            filters.append(f"[blurred_bg][sharp_fg]overlay=(W-w)/2:{main_fg_y}[comp1]")
+            filters.append(f"[blurred_bg][sharp_fg]overlay=(W-w)/2:{main_fg_y}{main_comp_output_tag}")
 
-            last_stream = "[comp1]"
-            final_map = last_stream
-
-            pip_input_idx_str = "1"
-            text_input_idx_str = "1"
-            if temp_pip_image_path and temp_text_image_path:
-                text_input_idx_str = "2"
-
-            if temp_pip_image_path:
-                pip_x, pip_y, _, _ = pip_roi
-                pip_final_y = pip_y - y_offset_pip
-                next_stream_name = "[comp2]" if temp_text_image_path else "[v_out]"
-                filters.append(f"{last_stream}[{pip_input_idx_str}:v]overlay={pip_x}:{pip_final_y}{next_stream_name}")
-                last_stream = next_stream_name
-                final_map = last_stream
-
+            # 如果有文字，则进行第二次叠加
             if temp_text_image_path:
+                text_input_idx_str = "1"
                 text_x = '(W-w)/2'
                 text_y = cy + y_offset_main - text_config['box_h'] - y_offset_text
-                filters.append(f"{last_stream}[{text_input_idx_str}:v]overlay={text_x}:{text_y}[v_out]")
-                final_map = "[v_out]"
-
-            if final_map == last_stream:
-                filters[-1] += "[v_out]"
-                final_map = "[v_out]"
+                filters.append(f"[comp1][{text_input_idx_str}:v]overlay={text_x}:{text_y}[v_out]")
 
             filter_complex_string = ";".join(filters)
+            # --- 修复结束 ---
+
             command.extend(['-filter_complex', filter_complex_string])
-            command.extend(['-map', final_map, '-map', '0:a?'])
+            command.extend(['-map', "[v_out]", '-map', '0:a?'])
 
             codec_to_use = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
             command.extend(['-c:v', codec_to_use, '-preset', 'medium', '-c:a', 'aac', '-b:a', '192k'])
             command.append(os.path.normpath(output_path))
 
             self.log_blur("  -> 正在调用FFmpeg核心进行高速合成...")
-            creation_flags = 0
-            if sys.platform == 'win32':
-                creation_flags = subprocess.CREATE_NO_WINDOW
             subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8',
                            creationflags=creation_flags)
 
@@ -3309,8 +3341,6 @@ class App(ctk.CTk):
         except Exception as e:
             return False, f"处理失败: {e}"
         finally:
-            if temp_pip_image_path and os.path.exists(temp_pip_image_path):
-                os.remove(temp_pip_image_path)
             if temp_text_image_path and os.path.exists(temp_text_image_path):
                 os.remove(temp_text_image_path)
 
@@ -3362,20 +3392,47 @@ class App(ctk.CTk):
         try:
             input_dir = self.blur_input_folder_entry.get()
             output_dir = self.blur_output_folder_entry.get()
-            self.log_blur("\n★★★ 模板设置完成！即将对所有视频应用相同配置... ★★★")
-            # --- 新增：从GUI获取裁剪时长 ---
+
+            all_text_lines = [line.strip() for line in
+                              self.blur_text_input_area.get("1.0", "end-1c").strip().split('\n') if line.strip()]
+
+            if self.blur_enable_text_switch.get() and not all_text_lines:
+                self.log_blur("错误: 已启用文案，但文案输入为空。")
+                return
+
+            num_tasks = len(video_files)
+            if self.blur_enable_text_switch.get():
+                num_tasks = min(len(video_files), len(all_text_lines))
+
+            self.log_blur(f"\n★★★ 模板设置完成！检测到 {len(video_files)} 个视频，将处理 {num_tasks} 个任务。 ★★★")
+
             try:
                 duration_str = self.blur_crop_duration_entry.get()
-                crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
+                original_duration = float(duration_str) if duration_str.strip() else 0
+                if original_duration > 0:
+                    crop_duration = original_duration + 1
+                    self.log_blur(
+                        f"信息: 预裁剪时长已自动加1秒以修正偏差 ({original_duration:.2f}s -> {crop_duration:.2f}s)")
+                else:
+                    crop_duration = 0
             except (ValueError, TypeError):
-                crop_duration = 0  # 如果输入无效，则不裁剪
-            # ---------------------------
-            all_text_lines = self.blur_text_input_area.get("1.0", "end-1c").strip().split('\n')
-            all_text_lines = [line.strip() for line in all_text_lines if line.strip()]
+                self.log_blur("警告: 预裁剪时长输入无效，将不进行裁剪。")
+                crop_duration = 0
+
+            # --- 核心修改：获取镜像和放大参数 ---
+            mirror_content = self.blur_mirror_switch.get() == 1
+            try:
+                zoom_factor = float(self.blur_zoom_entry.get())
+                if zoom_factor < 1.0: zoom_factor = 1.0
+            except (ValueError, TypeError):
+                zoom_factor = 1.0
+            # --- 修改结束 ---
 
             font_file = self.blur_font_menu.get()
-            try: base_path = sys._MEIPASS
-            except Exception: base_path = os.path.abspath(os.path.dirname(__file__))
+            try:
+                base_path = sys._MEIPASS
+            except Exception:
+                base_path = os.path.abspath(os.path.dirname(__file__))
             full_font_path = os.path.join(base_path, "zt", font_file)
 
             if self.blur_enable_text_switch.get() and not (font_file and os.path.exists(full_font_path)):
@@ -3389,35 +3446,44 @@ class App(ctk.CTk):
             }
             offsets_config = {
                 'main': int(self.blur_offset_main_entry.get()),
-                'pip': int(self.blur_offset_pip_entry.get()),
+                'pip': 0,
                 'text': int(self.blur_offset_text_entry.get())
             }
 
-            for i, filename in enumerate(video_files):
+            for i in range(num_tasks):
                 if self.blur_stop_event.is_set():
-                    self.log_blur("🔴 任务已由用户中止。"); break
+                    self.log_blur("🔴 任务已由用户中止。");
+                    break
+
+                filename = video_files[i]
                 try:
-                    self.log_blur(f"\n--- 处理进度: {i+1}/{len(video_files)} | 文件: {filename} ---")
+                    self.log_blur(f"\n--- 处理进度: {i + 1}/{num_tasks} | 文件: {filename} ---")
                     input_path = os.path.join(input_dir, filename)
                     output_path = os.path.join(output_dir, os.path.splitext(filename)[0] + "_processed.mp4")
 
                     current_text_config = None
-                    if self.blur_enable_text_switch.get() and all_text_lines:
+                    if self.blur_enable_text_switch.get():
                         current_text_config = text_base_config.copy()
-                        current_text_config['text'] = all_text_lines[i % len(all_text_lines)]
+                        current_text_config['text'] = all_text_lines[i]
                         self.log_blur(f"添加文案: {current_text_config['text']}")
 
+                    # --- 核心修改：传递新的参数 ---
                     success, message = self._blur_process_video(
                         input_path, output_path, self.blur_use_gpu_switch.get(),
-                        content_roi, pip_roi,
-                        current_text_config, offsets_config,crop_duration
+                        content_roi, None,  # pip_roi 已被禁用，传递 None
+                        current_text_config, offsets_config, crop_duration,
+                        mirror_content, zoom_factor
                     )
                     self.log_blur(f"✔️ {message}" if success else f"❌ {message}")
                 except Exception as e:
                     self.log_blur(f"处理文件 {filename} 时发生未知严重错误: {e}")
 
             if not self.blur_stop_event.is_set():
-                self.log_blur("\n===================================\n🎉 所有任务处理完毕！🎉\n===================================")
+                self.log_blur(
+                    "\n===================================\n🎉 所有任务处理完毕！🎉\n===================================")
+        except Exception as e:
+            self.log_blur(f"发生未预料的严重错误: {e}")
+            traceback.print_exc()
         finally:
             self.after(0, self._reset_blur_buttons)
   # ==============================================================================
@@ -3439,12 +3505,25 @@ class App(ctk.CTk):
         self.create_folder_selection_row(paths_frame, "模板文件夹 (带绿幕):", "选择包含绿幕模板视频的文件夹", "news_template_folder_entry")
         self.create_folder_selection_row(paths_frame, "输出文件夹:", "选择处理结果的存放位置", "news_output_folder_entry")
         self.create_widget_row(paths_frame, "预裁剪时长(秒):", "news_crop_duration", "4", placeholder="0或留空则不裁剪")
+        # --- 核心修复：修改UI布局，分两行显示 ---
+        effects_frame = ctk.CTkFrame(paths_frame, fg_color="transparent")
+        effects_frame.pack(fill="x", padx=10, pady=5)
 
+        self.news_mirror_switch = ctk.CTkSwitch(effects_frame, text="内容镜像")
+        self.news_mirror_switch.pack(anchor="w", pady=(5, 10))
+
+        zoom_frame = ctk.CTkFrame(effects_frame, fg_color="transparent")
+        zoom_frame.pack(fill="x")
+        ctk.CTkLabel(zoom_frame, text="内容放大倍数:", width=120, anchor="w").pack(side="left")
+        self.news_zoom_entry = ctk.CTkEntry(zoom_frame, placeholder_text="例如: 1.2")
+        self.news_zoom_entry.insert(0, "1.0")
+        self.news_zoom_entry.pack(side="left", fill="x", expand=True)
         # --- 2. 字幕配置 (使用 .pack 布局) ---
         text_frame = ctk.CTkFrame(scrollable_frame)
         text_frame.pack(fill="x", padx=5, pady=(10, 5))
         ctk.CTkLabel(text_frame, text="第二步: 字幕/文案配置", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(5,0))
 
+        # --- 修复结束 ---
         ctk.CTkLabel(text_frame, text="输入文案 (每行对应一个任务):").pack(anchor="w", padx=10, pady=(10, 2))
         self.news_text_input_area = ctk.CTkTextbox(text_frame, height=120)
         self.news_text_input_area.pack(fill="x", expand=True, padx=10, pady=(0, 10))
@@ -3582,30 +3661,49 @@ class App(ctk.CTk):
         return np.array(bg_image)
 
     def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False,
-                            gpu_codec='libx264', crop_duration=0):
-        """【最终健壮版 - FFmpeg核心 - 修正合成逻辑】"""
+                            gpu_codec='libx264', crop_duration=0, mirror_content=False, zoom_factor=1.0):
+        """【终极修复版】使用内存管道技术，彻底解决中文路径问题"""
         temp_text_image_path = None
         try:
-            # --- 步骤 1: 使用 OpenCV 定位模板视频的绿幕区域和尺寸 (保留) ---
-            cap = cv2.VideoCapture(template_path)
-            if not cap.isOpened():
-                return False, f"OpenCV无法打开模板视频: {os.path.basename(template_path)}"
+            ffmpeg_path = self._find_executable("ffmpeg")
+            if not ffmpeg_path:
+                return False, "找不到 ffmpeg.exe"
 
-            template_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            template_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # --- 核心修复：使用内存管道技术提取第一帧 ---
+            self.log_news_greenscreen("  -> 使用FFmpeg提取模板视频第一帧到内存...")
 
-            ret, template_first_frame = cap.read()
-            if not ret:
-                cap.release()
-                return False, f"OpenCV无法读取模板视频的第一帧: {os.path.basename(template_path)}"
+            command_extract = [
+                ffmpeg_path,
+                '-i', os.path.normpath(template_path),
+                '-frames:v', '1',  # 只提取1帧
+                '-f', 'image2pipe',  # 指定输出格式为管道
+                '-vcodec', 'png',  # 指定输出编码为PNG
+                '-'  # '-' 代表输出到 stdout (标准输出)
+            ]
 
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
+            # 执行命令并捕获标准输出
+            result = subprocess.run(command_extract, check=True, capture_output=True, creationflags=creation_flags)
+
+            # 将从管道接收到的二进制数据转换为Numpy数组
+            image_data = np.frombuffer(result.stdout, np.uint8)
+            # 使用OpenCV从内存中的Numpy数组解码出图像
+            template_first_frame = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+
+            if template_first_frame is None:
+                return False, "无法从内存数据中解码出图像帧。"
+            # --- 修复结束 ---
+
+            template_height, template_width, _ = template_first_frame.shape
             hsv = cv2.cvtColor(template_first_frame, cv2.COLOR_BGR2HSV)
             lower_green, upper_green = np.array([35, 43, 46]), np.array([85, 255, 255])
             green_mask = cv2.inRange(hsv, lower_green, upper_green)
             kernel = np.ones((15, 15), np.uint8)
             cleaned_mask = cv2.morphologyEx(green_mask, cv2.MORPH_CLOSE, kernel)
             contours, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cap.release()
 
             if not contours:
                 return False, f"在模板 '{os.path.basename(template_path)}' 中未找到可识别的绿幕区域。"
@@ -3613,7 +3711,6 @@ class App(ctk.CTk):
             gx, gy, gw, gh = cv2.boundingRect(max(contours, key=cv2.contourArea))
             self.log_news_greenscreen(f"  -> 已定位绿幕区域: x={gx}, y={gy}, w={gw}, h={gh}")
 
-            # --- 步骤 2: 使用 Pillow 生成文字图片 (保留) ---
             if text_config and text_config.get('text'):
                 self.log_news_greenscreen("  -> 正在生成文字图层...")
                 text_img_array = self._news_create_text_image(
@@ -3625,68 +3722,84 @@ class App(ctk.CTk):
                 temp_text_image_path = os.path.join(os.path.dirname(output_path),
                                                     f"temp_text_{random.randint(1000, 9999)}.png")
                 temp_text_image.save(temp_text_image_path)
-                self.log_news_greenscreen(f"  -> 临时文字图层已保存: {os.path.basename(temp_text_image_path)}")
 
-            # --- 步骤 3: 构建并执行修正后的 FFmpeg 命令 ---
-            ffmpeg_path = self._find_executable("ffmpeg")
-            if not ffmpeg_path:
-                return False, "找不到 ffmpeg.exe"
+            # 为最终的合成命令也准备好带引号的安全路径
+            safe_ffmpeg_path = f'"{os.path.normpath(ffmpeg_path)}"'
+            safe_content_path = f'"{os.path.normpath(content_path)}"'
+            safe_template_path_final = f'"{os.path.normpath(template_path)}"'
+            safe_output_path = f'"{os.path.normpath(output_path)}"'
+            safe_text_path = f'"{os.path.normpath(temp_text_image_path)}"' if temp_text_image_path else ""
 
-            norm_content_path = os.path.normpath(content_path)
-            norm_template_path = os.path.normpath(template_path)
-            norm_output_path = os.path.normpath(output_path)
-
-            command = [ffmpeg_path, '-y']
-
-            if crop_duration > 0:
-                command.extend(['-t', str(crop_duration)])
-            command.extend(['-i', norm_content_path])
-            command.extend(['-i', norm_template_path])
-
+            inputs_str = f"-i {safe_content_path} -i {safe_template_path_final}"
             if temp_text_image_path:
-                command.extend(['-i', os.path.normpath(temp_text_image_path)])
+                inputs_str += f" -i {safe_text_path}"
 
-            # --- 核心逻辑修正 ---
+            crop_str = f"-t {crop_duration}" if crop_duration > 0 else ""
+
+            # --- 核心修改：构建新的、包含镜像和放大逻辑的FFmpeg滤镜链 ---
             filters = []
             content_x, content_y, content_w, content_h = content_roi
 
-            # 滤镜1: 裁剪内容视频，并将其缩放到与绿幕区域同样大小，命名为 [content_ready]
-            filters.append(f"[0:v]crop={content_w}:{content_h}:{content_x}:{content_y},scale={gw}:{gh}[content_ready]")
+            # 1. 裁剪出原始的内容区域
+            filters.append(f"[0:v]crop={content_w}:{content_h}:{content_x}:{content_y}[cropped_content]")
 
-            # 滤镜2 (已修正): 将【模板视频】[1:v]作为底图，把准备好的内容 [content_ready] 叠加到绿幕的坐标(gx, gy)上。
+            last_content_stream = "[cropped_content]"
+
+            # 2. 如果需要放大，应用缩放和中心裁剪滤镜
+            if zoom_factor > 1.0:
+                self.log_news_greenscreen(f"  -> 应用放大: {zoom_factor:.2f}倍")
+                # iw, ih 代表当前流的输入宽度和高度
+                filters.append(f"{last_content_stream}scale=iw*{zoom_factor}:ih*{zoom_factor}[zoomed]")
+                filters.append(f"[zoomed]crop={content_w}:{content_h}[centered_zoom]")
+                last_content_stream = "[centered_zoom]"
+
+            # 3. 如果需要镜像，应用水平翻转滤镜
+            if mirror_content:
+                self.log_news_greenscreen("  -> 应用内容镜像")
+                filters.append(f"{last_content_stream}hflip[flipped]")
+                last_content_stream = "[flipped]"
+
+            # 4. 将最终处理好的内容，缩放到绿幕区域大小
+            filters.append(f"{last_content_stream}scale={gw}:{gh}[content_ready]")
+
+            # 5. 将内容叠加到模板上
             filters.append(f"[1:v][content_ready]overlay={gx}:{gy}[video_composited]")
-            # --- 修正结束 ---
 
-            last_stream = "[video_composited]"
+            # 6. 添加文字图层 (逻辑不变)
+            last_final_stream = "[video_composited]"
+            final_map = last_final_stream
             if temp_text_image_path:
                 text_x = (template_width - text_config['box_w']) / 2
                 text_y = gy - text_config['box_h'] - text_config['y_offset']
-                filters.append(f"{last_stream}[2:v]overlay={text_x}:{text_y}[v_out]")
+                filters.append(f"{last_final_stream}[2:v]overlay={text_x}:{text_y},format=yuv420p[v_out]")
                 final_map = "[v_out]"
             else:
-                final_map = last_stream
+                filters.append(f"{last_final_stream},format=yuv420p[v_out]")
+                final_map = "[v_out]"
 
             filter_complex_string = ";".join(filters)
+            # --- 修改结束 ---
 
-            command.extend(['-filter_complex', filter_complex_string])
-            command.extend(['-map', final_map])
-            command.extend(['-map', '1:a?'])
-
+            map_str = f'-map "{final_map}" -map 1:a?'
             codec_to_use = gpu_codec if use_gpu and self.is_gpu_available else 'libx264'
-            command.extend(['-c:v', codec_to_use])
-            command.extend(['-preset', 'medium'])
-            command.extend(['-c:a', 'aac', '-b:a', '192k'])
-            # 确保输出视频时长与模板视频一致
-            command.extend(['-t', str(cap.get(cv2.CAP_PROP_FRAME_COUNT) / cap.get(cv2.CAP_PROP_FPS))] if cap.get(
-                cv2.CAP_PROP_FPS) > 0 else [])
-            command.append(norm_output_path)
+            codec_str = f"-c:v {codec_to_use} -preset medium -c:a aac -b:a 192k"
+
+            ffprobe_path = self._find_executable("ffprobe")
+            duration_str = ""
+            if ffprobe_path:
+                try:
+                    safe_ffprobe_path = f'"{os.path.normpath(ffprobe_path)}"'
+                    cmd_probe_str = f'{safe_ffprobe_path} -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{os.path.normpath(template_path)}"'
+                    duration_result = subprocess.run(cmd_probe_str, shell=True, check=True, capture_output=True,
+                                                     text=True, creationflags=creation_flags).stdout.strip()
+                    duration_str = f"-t {duration_result}"
+                except:
+                    pass
+
+            command_string = f'{safe_ffmpeg_path} -y {crop_str} {inputs_str} -filter_complex "{filter_complex_string}" {map_str} {codec_str} {duration_str} {safe_output_path}'
 
             self.log_news_greenscreen("  -> 正在调用FFmpeg核心进行高速合成...")
-            creation_flags = 0
-            if sys.platform == 'win32':
-                creation_flags = subprocess.CREATE_NO_WINDOW
-
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8',
+            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8',
                            creationflags=creation_flags)
 
             return True, f"成功保存到: {os.path.basename(output_path)}"
@@ -3700,9 +3813,9 @@ class App(ctk.CTk):
             if temp_text_image_path and os.path.exists(temp_text_image_path):
                 try:
                     os.remove(temp_text_image_path)
-                    self.log_news_greenscreen("  -> 已清理临时文字图层。")
                 except OSError:
                     pass
+            # 因为不再创建第一帧的临时文件，所以也不需要清理了
     def start_news_greenscreen_processing(self):
         # The start button now only prepares and validates, then launches the thread.
         # ROI selection happens here, on the main thread, which is safer for GUI operations.
@@ -3738,53 +3851,102 @@ class App(ctk.CTk):
         threading.Thread(target=self.run_news_greenscreen_logic, args=(template_content_roi,), daemon=True).start()
 
     def run_news_greenscreen_logic(self, template_content_roi):
-        # This function does the batch processing, now that the ROI is already defined.
         try:
-            content_dir, template_dir, output_dir = self.news_content_folder_entry.get(), self.news_template_folder_entry.get(), self.news_output_folder_entry.get()
+            content_dir = self.news_content_folder_entry.get()
+            template_dir = self.news_template_folder_entry.get()
+            output_dir = self.news_output_folder_entry.get()
+            # --- 核心修改：获取时长后自动加1 ---
+            try:
+                duration_str = self.news_crop_duration_entry.get()
+                original_duration = float(duration_str) if duration_str.strip() else 0
+                if original_duration > 0:
+                    crop_duration = original_duration + 1
+                    self.log_news_greenscreen(
+                        f"信息: 预裁剪时长已自动加1秒以修正偏差 ({original_duration:.2f}s -> {crop_duration:.2f}s)")
+                else:
+                    crop_duration = 0
+            except (ValueError, TypeError):
+                self.log_news_greenscreen("警告: 预裁剪时长输入无效，将不进行裁剪。")
+                crop_duration = 0
+            # --- 修改结束 ---
+            # --- 获取所有配置参数 (逻辑不变) ---
             font_file = self.news_font_menu.get()
             try:
                 duration_str = self.news_crop_duration_entry.get()
                 crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
             except (ValueError, TypeError):
-                crop_duration = 0  # 如果输入无效，则不裁剪
-            try: base_path = sys._MEIPASS
-            except Exception: base_path = os.path.abspath(os.path.dirname(__file__))
-            font_dir = os.path.join(base_path, "zt")
-            full_font_path = os.path.join(font_dir, font_file)
+                crop_duration = 0
+
+            try:
+                base_path = sys._MEIPASS
+            except Exception:
+                base_path = os.path.abspath(os.path.dirname(__file__))
+            full_font_path = os.path.join(base_path, "zt", font_file)
 
             if not (font_file and os.path.exists(full_font_path)):
                 self.log_news_greenscreen(f"错误: 选择的字体文件 '{font_file}' 无效或 'zt' 文件夹中不存在！")
                 return
 
-            all_text_lines = self.news_text_input_area.get("1.0", "end-1c").strip().split('\n')
-            all_text_lines = [line.strip() for line in all_text_lines if line.strip()]
-            self.log_news_greenscreen("="*50 + "\n任务开始...")
+            all_text_lines = [line.strip() for line in
+                              self.news_text_input_area.get("1.0", "end-1c").strip().split('\n') if line.strip()]
+            if not all_text_lines:
+                self.log_news_greenscreen("错误: 文案输入为空，无法进行一对一匹配。")
+                return
 
             use_gpu = self.news_use_gpu_switch.get() == 1
             gpu_codec = self.news_gpu_codec_menu.get().split(' ')[0]
-
             if use_gpu and self.is_gpu_available:
                 self.log_news_greenscreen(f"*** GPU加速已启用, 编码器: {gpu_codec} ***")
             else:
                 self.log_news_greenscreen("*** 将使用CPU进行编码 ***")
 
-            content_files = sorted([f for f in os.listdir(content_dir) if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))])
-            template_subfolders = sorted([d for d in os.listdir(template_dir) if os.path.isdir(os.path.join(template_dir, d))])
+            # --- 核心修复：恢复正确的文件夹扫描和矩阵式任务列表构建逻辑 ---
+            video_ext = ('.mp4', '.mov', '.avi', '.mkv')
+            content_files = sorted([f for f in os.listdir(content_dir) if f.lower().endswith(video_ext)])
 
+            # 1. 扫描模板文件夹下的子文件夹
+            template_subfolders = sorted(
+                [d for d in os.listdir(template_dir) if os.path.isdir(os.path.join(template_dir, d))])
+
+            if not content_files:
+                self.log_news_greenscreen("错误：内容文件夹中没有任何视频文件！")
+                return
             if not template_subfolders:
                 self.log_news_greenscreen("错误：模板文件夹中不包含任何子文件夹！")
                 return
 
-            self.log_news_greenscreen("\n★★★ 模板设置完成！即将开始矩阵式批量合成... ★★★")
+            # 2. 构建包含所有组合的任务列表
             task_list = []
             for subfolder_name in template_subfolders:
                 template_folder_path = os.path.join(template_dir, subfolder_name)
-                template_files = sorted([f for f in os.listdir(template_folder_path) if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))])
+                template_files = sorted([f for f in os.listdir(template_folder_path) if f.lower().endswith(video_ext)])
                 if not template_files: continue
+                # 对于每个内容视频，都与当前子文件夹的所有模板视频进行配对
                 for content_filename in content_files:
                     for template_filename in template_files:
-                        task_list.append({'subfolder': subfolder_name, 'content': content_filename, 'template': template_filename})
+                        task_list.append({
+                            'subfolder': subfolder_name,
+                            'content': content_filename,
+                            'template': template_filename
+                        })
 
+            if not task_list:
+                self.log_news_greenscreen("错误：在模板子文件夹中未找到任何视频文件。")
+                return
+
+            # 3. 以任务总数和文案总数中的较小者，确定最终处理数量
+            num_tasks = min(len(task_list), len(all_text_lines))
+            self.log_news_greenscreen(
+                f"\n★★★ 模板设置完成！检测到 {len(task_list)} 个潜在合成任务和 {len(all_text_lines)} 行文案，将处理 {num_tasks} 个任务。 ★★★")
+            # --- 修复结束 ---
+            # --- 新增：从UI获取镜像和放大参数 ---
+            mirror_content = self.news_mirror_switch.get() == 1
+            try:
+                zoom_factor = float(self.news_zoom_entry.get())
+                if zoom_factor < 1.0: zoom_factor = 1.0
+            except (ValueError, TypeError):
+                zoom_factor = 1.0
+            # --- 新增结束 ---
             text_config = {
                 'y_offset': int(self.news_y_offset_entry.get()), 'box_w': int(self.news_box_w_entry.get()),
                 'box_h': int(self.news_box_h_entry.get()), 'font_color': self.news_font_color_value,
@@ -3792,41 +3954,49 @@ class App(ctk.CTk):
                 'corner_radius': int(self.news_corner_radius_entry.get())
             }
 
-            for i, task in enumerate(task_list):
+            for i in range(num_tasks):
                 if self.news_stop_event.is_set():
                     self.log_news_greenscreen("🔴 任务已由用户中止。")
                     break
+
                 try:
-                    self.log_news_greenscreen(f"\n--- 任务进度: {i+1}/{len(task_list)} ---")
+                    # 从任务列表中按顺序取出一个任务
+                    task = task_list[i]
+                    current_text = all_text_lines[i]
+
+                    self.log_news_greenscreen(f"\n--- 任务进度: {i + 1}/{num_tasks} ---")
                     content_path = os.path.join(content_dir, task['content'])
                     template_path = os.path.join(template_dir, task['subfolder'], task['template'])
+
+                    # 构建正确的输出路径
                     output_subfolder_path = os.path.join(output_dir, task['subfolder'])
                     os.makedirs(output_subfolder_path, exist_ok=True)
                     output_basename = f"{os.path.splitext(task['content'])[0]}_on_{os.path.splitext(task['template'])[0]}.mp4"
                     output_path = os.path.join(output_subfolder_path, output_basename)
+
                     self.log_news_greenscreen(f"正在合成: '{task['content']}' -> '{task['template']}'")
+                    self.log_news_greenscreen(f"添加文案: {current_text}")
 
-                    current_text = all_text_lines[i % len(all_text_lines)] if all_text_lines else ""
                     text_config['text'] = current_text
-                    if current_text: self.log_news_greenscreen(f"添加文案: {current_text}")
-
                     success, message = self._news_process_video(
                         content_path, template_path, output_path,
                         template_content_roi, text_config,
-                        use_gpu, gpu_codec,crop_duration
+                        use_gpu, gpu_codec, crop_duration,
+                        mirror_content, zoom_factor
                     )
                     self.log_news_greenscreen(f"✔️ {message}" if success else f"❌ {message}")
                 except Exception as e:
-                    self.log_news_greenscreen(f"处理文件 '{task['content']}' 时发生未知严重错误: {e}")
+                    self.log_news_greenscreen(f"处理任务 {i + 1} 时发生未知严重错误: {e}")
 
             if not self.news_stop_event.is_set():
-                self.log_news_greenscreen("\n===================================\n🎉 所有任务处理完毕！🎉\n===================================")
+                self.log_news_greenscreen(
+                    "\n===================================\n🎉 所有任务处理完毕！🎉\n===================================")
 
         except Exception as e:
             self.log_news_greenscreen(f"发生未预料的严重错误: {e}")
+            traceback.print_exc()
         finally:
             self.after(0, self._reset_news_greenscreen_buttons)
-
     def _reset_news_greenscreen_buttons(self):
         self.news_start_button.configure(state="normal", text="设置模板并开始批量合成")
 
@@ -5512,6 +5682,7 @@ class App(ctk.CTk):
                 'phone_serial': self.video_phone_serial_entry.get(),
                 'durations': self.video_durations_entry.get(),
                 'use_gpu': self.video_use_gpu_switch.get(),
+                'random_remix': self.video_random_remix_switch.get(),
                 'shared_font_file': self.video_shared_font_file_entry.get(),
                 'shared_size': self.video_shared_size_entry.get(),
                 'shared_max_width_ratio': self.video_shared_max_width_ratio_entry.get(),
@@ -5588,15 +5759,28 @@ class App(ctk.CTk):
                 'content_folder': self.news_content_folder_entry.get(),
                 'template_folder': self.news_template_folder_entry.get(),
                 'output_folder': self.news_output_folder_entry.get(),
+                'crop_duration': self.news_crop_duration_entry.get(),
+                'mirror': self.news_mirror_switch.get(),
+                'zoom': self.news_zoom_entry.get()
             },
             'news_blur_settings': {
                 'input_folder': self.blur_input_folder_entry.get(),
                 'output_folder': self.blur_output_folder_entry.get(),
+                'crop_duration': self.blur_crop_duration_entry.get(),
+                'mirror': self.blur_mirror_switch.get(),
+                'zoom': self.blur_zoom_entry.get()
             },
             'greenscreen_composite_settings': {
                 'source_folder': self.gs_composite_source_folder_entry.get(),
                 'bg_folder': self.gs_composite_bg_folder_entry.get(),
                 'output_folder': self.gs_composite_output_folder_entry.get(),
+                'use_gs_audio': self.gs_composite_use_gs_audio_switch.get(),
+                'ghost_freeze': self.gs_composite_ghost_freeze_switch.get(),
+                'freeze_duration': self.composite_freeze_duration_entry.get(),
+                'similarity': self.gs_composite_similarity_slider.get(),
+                'blend': self.gs_composite_blend_slider.get(),
+                'despill': self.gs_composite_despill_slider.get(),
+                'quality': self.gs_composite_quality_slider.get()
             },
             'video_clone_settings': {
                 'input_folder': self.clone_input_folder_entry.get(),
@@ -5606,6 +5790,8 @@ class App(ctk.CTk):
             'cut_settings': {
                 'input_folder': self.cut_input_folder_entry.get(),
                 'output_folder': self.cut_output_folder_entry.get(),
+                'play_until': self.cut_play_until_entry.get(),
+                'resume_from': self.cut_resume_from_entry.get(),
             },
             'lut_settings': {
                 'video_folder': self.lut_video_folder_entry.get(),
@@ -5642,7 +5828,6 @@ class App(ctk.CTk):
             self.settings_loaded = False
             return
 
-        # --- 核心修复：将安全的加载辅助函数定义在函数内部 ---
         def _load_entry(entry_widget_name, config, key, default=''):
             if hasattr(self, entry_widget_name):
                 widget = getattr(self, entry_widget_name)
@@ -5673,7 +5858,9 @@ class App(ctk.CTk):
                 elif default and default in options:
                     widget.set(default)
 
-        # --- 辅助函数定义结束 ---
+        def _load_slider(slider_widget_name, config, key, default=0):
+            if hasattr(self, slider_widget_name):
+                getattr(self, slider_widget_name).set(config.get(key, default))
 
         # --- 使用辅助函数统一加载所有配置 ---
         vs = settings.get('video_settings', {})
@@ -5684,6 +5871,7 @@ class App(ctk.CTk):
         _load_entry('video_phone_serial_entry', vs, 'phone_serial')
         _load_entry('video_durations_entry', vs, 'durations')
         _load_switch('video_use_gpu_switch', vs, 'use_gpu')
+        _load_switch('video_random_remix_switch', vs, 'random_remix')
         _load_entry('video_shared_font_file_entry', vs, 'shared_font_file',
                     get_resource_path(os.path.join('assets', 'WenYue_XinQingNianTi_J-W8.otf')))
         _load_entry('video_shared_size_entry', vs, 'shared_size', '60')
@@ -5759,12 +5947,41 @@ class App(ctk.CTk):
         _load_entry('extractor_interval_entry', extractor_s, 'interval', '3')
         _load_switch('extractor_resize_switch', extractor_s, 'resize', True)
 
+        news_gs = settings.get('news_greenscreen_settings', {})
+        _load_entry('news_content_folder_entry', news_gs, 'content_folder')
+        _load_entry('news_template_folder_entry', news_gs, 'template_folder')
+        _load_entry('news_output_folder_entry', news_gs, 'output_folder')
+        _load_entry('news_crop_duration_entry', news_gs, 'crop_duration', '4')
+        _load_switch('news_mirror_switch', news_gs, 'mirror', False)
+        _load_entry('news_zoom_entry', news_gs, 'zoom', '1.0')
+
+        news_blur = settings.get('news_blur_settings', {})
+        _load_entry('blur_input_folder_entry', news_blur, 'input_folder')
+        _load_entry('blur_output_folder_entry', news_blur, 'output_folder')
+        _load_entry('blur_crop_duration_entry', news_blur, 'crop_duration', '4')
+        _load_switch('blur_mirror_switch', news_blur, 'mirror', False)
+        _load_entry('blur_zoom_entry', news_blur, 'zoom', '1.0')
+
+        gs_s = settings.get('greenscreen_composite_settings', {})
+        _load_entry('gs_composite_source_folder_entry', gs_s, 'source_folder')
+        _load_entry('gs_composite_bg_folder_entry', gs_s, 'bg_folder')
+        _load_entry('gs_composite_output_folder_entry', gs_s, 'output_folder')
+        _load_switch('gs_composite_use_gs_audio_switch', gs_s, 'use_gs_audio', False)
+        _load_switch('gs_composite_ghost_freeze_switch', gs_s, 'ghost_freeze', False)
+        _load_entry('composite_freeze_duration_entry', gs_s, 'freeze_duration', '3')
+        _load_slider('gs_composite_similarity_slider', gs_s, 'similarity', 0.2)
+        _load_slider('gs_composite_blend_slider', gs_s, 'blend', 0.1)
+        _load_slider('gs_composite_despill_slider', gs_s, 'despill', 0.5)
+        _load_slider('gs_composite_quality_slider', gs_s, 'quality', 24)
+
         _load_entry('ios_source_folder_entry', settings.get('ios_transfer_settings', {}), 'source_folder')
         _load_entry('clone_input_folder_entry', settings.get('video_clone_settings', {}), 'input_folder')
         _load_entry('clone_output_folder_entry', settings.get('video_clone_settings', {}), 'output_folder')
         _load_entry('clone_total_duration_entry', settings.get('video_clone_settings', {}), 'duration', '15')
         _load_entry('cut_input_folder_entry', settings.get('cut_settings', {}), 'input_folder')
         _load_entry('cut_output_folder_entry', settings.get('cut_settings', {}), 'output_folder')
+        _load_entry('cut_play_until_entry', settings.get('cut_settings', {}), 'play_until', '2')
+        _load_entry('cut_resume_from_entry', settings.get('cut_settings', {}), 'resume_from', '6')
         _load_entry('lut_video_folder_entry', settings.get('lut_settings', {}), 'video_folder')
         _load_entry('lut_filter_folder_entry', settings.get('lut_settings', {}), 'filter_folder')
         _load_entry('lut_output_folder_entry', settings.get('lut_settings', {}), 'output_folder')
@@ -5782,11 +5999,6 @@ class App(ctk.CTk):
                                                                                          self.image_num_groups_entry)
         if hasattr(self, 'ab_phone_serial_entry'): self._update_exclusive_entry_state(self.ab_phone_serial_entry,
                                                                                       self.ab_num_groups_entry)
-
-    def _update_color_widget(self, attr_name, color_value):
-        # ... (此函数保持不变) ...
-        pass
-
     def _update_color_widget(self, attr_name, color_value): setattr(self, attr_name + "_value", color_value); button = getattr(self, attr_name + "_button"); button.configure(text=str(color_value), fg_color="gray" if "rgba" in str(color_value) else color_value)
 
 # ==============================================================================
