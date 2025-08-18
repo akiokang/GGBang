@@ -2,6 +2,7 @@
 #0704-适配IOS格式MOV
 #0705-新增视频克隆
 import ffmpeg
+import math
 import customtkinter as ctk
 from tkinter import filedialog, colorchooser, messagebox as tk_messagebox
 import threading
@@ -25,8 +26,9 @@ import subprocess
 import platform
 from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorClip, ImageClip, ImageSequenceClip
 from moviepy.video.fx import all as vfx
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor, ImageFilter # <--- 确保 ImageFilter 在这里
 import moviepy.config as cf
+from pathlib import Path
 # --- iOS批量传输 全局配置 ---
 MCAST_GRP = '224.0.0.167'
 MCAST_PORT = 53317
@@ -396,6 +398,7 @@ class App(ctk.CTk):
         self.img_to_video_stop_event = threading.Event()
         self.ITV_PRESETS_FILE = get_persistent_settings_path("img_to_video_presets.json")
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
+        self.VIDEO_PRESETS_FILE = get_persistent_settings_path("video_presets.json")
         self.active_ffmpeg_process = None
         try:
             # cv2.data.haarcascades 会自动指向OpenCV库中存放模型文件的正确路径
@@ -432,7 +435,7 @@ class App(ctk.CTk):
         self.setup_graphic_workflow()
         # 调用所有功能的UI设置函数
         self.setup_master_video_workflow()
-        self.setup_greenscreen_composite_workflow()
+        self.setup_greenscreen_composite_workflow(self.main_tabview.tab("绿幕合成"))
         self.setup_ios_transfer_workflow()
         self.setup_cut_workflow()
         self.setup_dualscreen_workflow()
@@ -443,6 +446,8 @@ class App(ctk.CTk):
 
         # 加载设置并设置窗口关闭行为
         self.load_settings()
+        self._video_populate_presets_dropdown()  # 新增：启动时加载视频预设
+
         self._itv_populate_presets_dropdown()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -528,6 +533,17 @@ class App(ctk.CTk):
     # ==============================================================================
     # --- 【新增功能】图转视频 ---
     # ==============================================================================
+    def _toggle_itv_mode_widgets(self):
+        """根据'单一模式'开关的状态，调整“图转视频”UI控件的标签文本。"""
+        if not hasattr(self, 'itv_single_mode_switch'):
+            return
+
+        is_single_mode = self.itv_single_mode_switch.get() == 1
+        if is_single_mode:
+            self.itv_num_groups_label.configure(text="生成视频数:")
+        else:
+            self.itv_num_groups_label.configure(text="生成组数:")
+
     def setup_img_to_video_workflow(self, parent_tab):
         """创建“图转视频”功能的UI界面"""
         tab = parent_tab
@@ -551,10 +567,36 @@ class App(ctk.CTk):
                                          "itv_image_folder_entry")
         self.create_folder_selection_row(tab, "输出文件夹:", "选择视频的保存位置", "itv_output_folder_entry")
 
-        # --- 新增：生成组数输入框 ---
-        self.create_widget_row(tab, "生成组数:", "itv_num_groups", "1").pack(fill="x", padx=10, pady=5)
+        # --- 新增: 模式开关 ---
+        mode_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        mode_frame.pack(fill="x", padx=10, pady=(10, 0))
+        self.itv_single_mode_switch = ctk.CTkSwitch(mode_frame, text="单一模式 (视频直接输出到根目录，不分组)",
+                                                    command=self._toggle_itv_mode_widgets)
+        self.itv_single_mode_switch.pack(anchor="w")
+        self.itv_single_mode_switch.select()
 
-        self.create_widget_row(tab, "时长规则(用.分隔):", "itv_durations", "", placeholder="例如: 4.5-2.2 (4秒1张, 5秒2张, 2秒1张)").pack(fill="x", padx=10, pady=5)
+        # --- 修改: 生成数量输入框 ---
+        num_groups_frame = self.create_widget_row(tab, "生成组数:", "itv_num_groups", "1")
+        self.itv_num_groups_label = num_groups_frame.winfo_children()[0]  # 获取CTkLabel控件的引用
+        num_groups_frame.pack(fill="x", padx=10, pady=5)
+
+        self.create_widget_row(tab, "时长规则(用.分隔):", "itv_durations", "",
+                               placeholder="例如: 4-1.5-2 (4秒1张, 5秒2张)").pack(fill="x", padx=10, pady=5)
+
+        # --- **新增**：缩放幅度和速度的UI配置 ---
+        self.create_widget_row(tab, "缩放幅度:", "itv_zoom_amplitude", "0.05",
+                               placeholder="建议0.01-0.2之间, 数值越大摆动幅度越大").pack(fill="x", padx=10, pady=5)
+        self.create_widget_row(tab, "缩放速度:", "itv_zoom_speed", "2.0",
+                               placeholder="建议1.0-5.0之间, 数值越大摆动越快").pack(fill="x", padx=10, pady=5)
+        # --- **新增结束** ---
+
+        # --- GPU加速开关 ---
+        gpu_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        gpu_frame.pack(fill="x", padx=10, pady=(5, 15))
+        self.itv_use_gpu_switch = ctk.CTkSwitch(gpu_frame, text="启用GPU加速编码 (需NVIDIA显卡)")
+        self.itv_use_gpu_switch.pack(anchor="w")
+        if self.is_gpu_available:
+            self.itv_use_gpu_switch.select()  # 如果检测到GPU，默认开启
 
         # --- 按钮与日志 ---
         button_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -570,9 +612,11 @@ class App(ctk.CTk):
                                              fg_color="red", hover_color="darkred")
         self.itv_stop_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
 
-        self.itv_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9AA")
+        self.itv_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9")
         self.itv_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
 
+        # 初始化UI状态并加载预设
+        self._toggle_itv_mode_widgets()
         self._itv_populate_presets_dropdown()
 
     def log_itv(self, message, clear=False):
@@ -600,7 +644,11 @@ class App(ctk.CTk):
         preset_data = {
             "image_folder": self.itv_image_folder_entry.get(),
             "output_folder": self.itv_output_folder_entry.get(),
-            "durations": self.itv_durations_entry.get()
+            "durations": self.itv_durations_entry.get(),
+            "single_mode": self.itv_single_mode_switch.get(),
+            # 新增
+            "zoom_amplitude": self.itv_zoom_amplitude_entry.get(),
+            "zoom_speed": self.itv_zoom_speed_entry.get()
         }
 
         try:
@@ -634,6 +682,19 @@ class App(ctk.CTk):
                 self.itv_output_folder_entry.insert(0, preset_data.get("output_folder", ""))
                 self.itv_durations_entry.delete(0, 'end')
                 self.itv_durations_entry.insert(0, preset_data.get("durations", ""))
+
+                # 新增
+                self.itv_zoom_amplitude_entry.delete(0, 'end')
+                self.itv_zoom_amplitude_entry.insert(0, preset_data.get("zoom_amplitude", "0.05"))
+                self.itv_zoom_speed_entry.delete(0, 'end')
+                self.itv_zoom_speed_entry.insert(0, preset_data.get("zoom_speed", "2.0"))
+
+                if preset_data.get("single_mode", 1) == 1:
+                    self.itv_single_mode_switch.select()
+                else:
+                    self.itv_single_mode_switch.deselect()
+                self._toggle_itv_mode_widgets()
+
                 self.log_itv(f"ℹ️ 已加载预设 '{preset_name}'。")
         except (FileNotFoundError, json.JSONDecodeError) as e:
             self.log_itv(f"❌ 加载预设失败: {e}")
@@ -645,21 +706,120 @@ class App(ctk.CTk):
         self.log_itv("", clear=True)
         threading.Thread(target=self.run_img_to_video_logic, daemon=True).start()
 
+    def _itv_worker_ffmpeg(self, image_path, output_path, duration, use_gpu, zoom_amplitude, zoom_speed):
+        """
+        【全FFmpeg高性能版 - v15 - 最终修正版】修正变量名拼写错误。
+        """
+        proc = None  # 初始化FFmpeg进程变量
+        try:
+            # --- 1. 获取FFmpeg路径和通用参数 ---
+            ffmpeg_path = self._find_executable("ffmpeg")
+            if not ffmpeg_path:
+                self.log_itv(f"  -> ❌ 错误: 找不到 ffmpeg.exe");
+                return False
+
+            W, H = 1080, 1920
+            fps = 30
+            total_frames = int(duration * fps)
+
+            # --- 2. 准备FFmpeg命令，配置为从管道接收数据 ---
+            command = [
+                ffmpeg_path, '-y',
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{W}x{H}',
+                '-pix_fmt', 'bgr24',
+                '-r', str(fps),
+                '-i', '-',
+                '-an',
+            ]
+
+            if use_gpu and self.is_gpu_available:
+                self.log_itv("    -> 使用OpenCV+GPU管道...")
+                command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23', '-pix_fmt', 'yuv420p'])
+            else:
+                self.log_itv("    -> 使用OpenCV+CPU管道...")
+                command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p'])
+
+            command.append(os.path.normpath(output_path))
+
+            # --- 3. 启动FFmpeg子进程，并打开stdin管道 ---
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, creationflags=creation_flags,
+                                    stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
+
+            # --- 4. 使用OpenCV进行逐帧计算和处理 ---
+            self.log_itv("    -> OpenCV正在逐帧计算并传送数据...")
+            img_original = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if img_original is None:
+                raise IOError(f"OpenCV无法读取图片: {image_path}")
+
+            orig_h, orig_w, _ = img_original.shape
+            scale_factor = max(W / orig_w, H / orig_h)
+
+            for i in range(total_frames):
+                t = i / fps
+
+                # **核心修复：将错误的变量名 `speed` 修正为正确的 `zoom_speed`**
+                dynamic_factor = 1 + zoom_amplitude * math.sin(zoom_speed * t * math.pi / duration)
+
+                # 安全保护，确保缩放因子永远为正数
+                safe_dynamic_factor = max(0.01, dynamic_factor)
+
+                # 使用安全的缩放因子进行最终计算
+                current_zoom = scale_factor * safe_dynamic_factor
+
+                new_w, new_h = int(orig_w * current_zoom), int(orig_h * current_zoom)
+
+                if new_w == 0 or new_h == 0: continue
+
+                resized_img = cv2.resize(img_original, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+
+                top = (new_h - H) // 2
+                left = (new_w - W) // 2
+                final_frame = resized_img[top:top + H, left:left + W]
+
+                proc.stdin.write(final_frame.tobytes())
+
+            self.log_itv("    -> 所有帧处理完毕，等待FFmpeg完成编码...")
+
+            # --- 5. 关闭管道并等待FFmpeg完成 ---
+            proc.stdin.close()
+            stderr_data = proc.stderr.read()
+            proc.wait()
+
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, command,
+                                                    stderr=stderr_data.decode('utf-8', 'ignore'))
+
+            return True
+        except (subprocess.CalledProcessError, Exception) as e:
+            error_message = f"  -> ❌ 错误: {e}"
+            if hasattr(e, 'stderr') and e.stderr:
+                error_message += f"\n     FFmpeg错误: {e.stderr.strip()}"
+            self.log_itv(error_message)
+            if proc and proc.poll() is None:
+                proc.kill()
+            return False
+
     def run_img_to_video_logic(self):
         try:
-            # --- 新增：导入数学库用于动画计算 ---
-            import math
-
             image_root_folder = self.itv_image_folder_entry.get()
             output_folder = self.itv_output_folder_entry.get()
             durations_str = self.itv_durations_entry.get()
-            num_groups = self._safe_int_convert(self.itv_num_groups_entry.get(), 1)
+            num_to_generate = self._safe_int_convert(self.itv_num_groups_entry.get(), 1)
+            is_single_mode = self.itv_single_mode_switch.get() == 1
+            use_gpu = self.itv_use_gpu_switch.get() == 1
+
+            # --- **新增**: 从UI读取缩放参数 ---
+            zoom_amplitude = self._safe_float_convert(self.itv_zoom_amplitude_entry.get(), 0.05)
+            zoom_speed = self._safe_float_convert(self.itv_zoom_speed_entry.get(), 2.0)
+            # --- **新增结束** ---
 
             if not all([image_root_folder, output_folder, durations_str]):
-                self.log_itv("❌ 错误: 图片文件夹、输出文件夹和时长都必须填写。")
+                self.log_itv("❌ 错误: 图片文件夹、输出文件夹和时长都必须填写。");
                 return
-
-            # 解析时长规则 (逻辑不变)
             instructions = []
             try:
                 parts = durations_str.strip().split('.')
@@ -671,135 +831,113 @@ class App(ctk.CTk):
                     else:
                         instructions.append((float(part), 1))
             except Exception as e:
-                self.log_itv(f"❌ 错误: 时长格式无法解析。错误: {e}")
+                self.log_itv(f"❌ 错误: 时长格式无法解析。错误: {e}");
                 return
-
             if not instructions: self.log_itv("❌ 错误: 未解析出任何有效指令。"); return
-            if num_groups <= 0: self.log_itv("❌ 错误: 生成组数必须大于0。"); return
-
+            if num_to_generate <= 0: self.log_itv("❌ 错误: 生成数量必须大于0。"); return
             ffmpeg_path = self._find_executable("ffmpeg")
             if not ffmpeg_path: self.log_itv("❌ 错误: 找不到 ffmpeg.exe，无法执行任务。"); return
 
             image_ext = ('.png', '.jpg', '.jpeg', '.webp')
-
-            # 预检 (逻辑不变)
             self.log_itv("--- 任务预检开始 ---")
-            all_checks_passed = True
-            for i, (_, num_images) in enumerate(instructions):
-                subfolder_name = str(i + 1)
-                subfolder_path = os.path.join(image_root_folder, subfolder_name)
-                if not os.path.isdir(subfolder_path):
-                    self.log_itv(f"❌ 预检失败: 找不到子文件夹 '{subfolder_name}'。")
-                    all_checks_passed = False;
-                    break
+            if is_single_mode:
+                self.log_itv("  -> 单一模式: 正在检查根目录图片数量...")
+                images_per_video = sum(num for _, num in instructions)
+                total_images_needed = images_per_video * num_to_generate
+                available_images = [f for f in os.listdir(image_root_folder) if
+                                    f.lower().endswith(image_ext) and os.path.isfile(
+                                        os.path.join(image_root_folder, f))]
+                if len(available_images) < total_images_needed:
+                    self.log_itv(f"❌ 预检失败: 图片文件夹 '{os.path.basename(image_root_folder)}' 图片不足。");
+                    self.log_itv(f"   需要 {total_images_needed} 张图片，但只有 {len(available_images)} 张。");
+                    self.log_itv("--- 任务中止，请根据提示补充文件。 ---");
+                    return
+                self.log_itv("✅ 预检通过，根目录图片数量充足。")
+                image_pool = [os.path.join(image_root_folder, f) for f in available_images];
+                random.shuffle(image_pool)
+            else:
+                self.log_itv("  -> 组模式: 正在检查子目录图片数量...");
+                all_checks_passed = True
+                for i, (_, num_images) in enumerate(instructions):
+                    subfolder_path = os.path.join(image_root_folder, str(i + 1))
+                    if not os.path.isdir(subfolder_path):
+                        self.log_itv(f"❌ 预检失败: 找不到子文件夹 '{(i + 1)}'。");
+                        all_checks_passed = False;
+                        break
+                    available_images = [f for f in os.listdir(subfolder_path) if f.lower().endswith(image_ext)]
+                    if len(available_images) < num_images * num_to_generate:
+                        self.log_itv(f"❌ 预检失败: 子文件夹 '{(i + 1)}' 图片不足。");
+                        self.log_itv(
+                            f"   需要 {num_images * num_to_generate} 张图片，但只有 {len(available_images)} 张。");
+                        all_checks_passed = False;
+                        break
+                if not all_checks_passed: self.log_itv("--- 任务中止，请根据提示补充文件。 ---"); return
+                self.log_itv("✅ 预检通过，所有子文件夹和图片数量充足。")
 
-                available_images = [f for f in os.listdir(subfolder_path) if f.lower().endswith(image_ext)]
-                if len(available_images) < num_images * num_groups:
-                    self.log_itv(f"❌ 预检失败: 子文件夹 '{subfolder_name}' 图片不足。")
-                    self.log_itv(f"   需要 {num_images * num_groups} 张图片，但只有 {len(available_images)} 张。")
-                    all_checks_passed = False;
-                    break
-
-            if not all_checks_passed:
-                self.log_itv("--- 任务中止，请根据提示补充文件。 ---")
-                return
-            self.log_itv("✅ 预检通过，所有文件夹和图片数量充足。")
-
-            # 外层循环，处理组 (逻辑不变)
-            for i in range(num_groups):
-                group_num = i + 1
+            for i in range(num_to_generate):
+                loop_index = i + 1
                 if self.img_to_video_stop_event.is_set(): self.log_itv("🔴 任务被用户中止。"); break
-                self.log_itv(f"\n================== 开始生成第 {group_num}/{num_groups} 组视频 ==================")
 
-                group_output_folder = os.path.join(output_folder, f"group-{group_num}")
-                os.makedirs(group_output_folder, exist_ok=True)
+                if is_single_mode:
+                    self.log_itv(
+                        f"\n================== 开始生成第 {loop_index}/{num_to_generate} 个视频 ==================")
+                    final_base_folder, temp_dir = output_folder, os.path.join(output_folder,
+                                                                              f"temp_clips_video_{loop_index}")
+                else:
+                    self.log_itv(
+                        f"\n================== 开始生成第 {loop_index}/{num_to_generate} 组视频 ==================")
+                    final_base_folder, temp_dir = os.path.join(output_folder, f"group-{loop_index}"), os.path.join(
+                        output_folder, f"temp_clips_group_{loop_index}")
+                    os.makedirs(final_base_folder, exist_ok=True)
 
-                temp_dir = os.path.join(output_folder, f"temp_clips_group_{group_num}")
                 if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
                 os.makedirs(temp_dir)
-
                 temp_clip_paths = []
                 clip_counter = 0
 
-                # --- 阶段一: 使用 MoviePy 生成带全新特效的临时片段 ---
                 for idx, (total_duration, num_images) in enumerate(instructions):
                     if self.img_to_video_stop_event.is_set(): break
-                    subfolder_name = str(idx + 1)
-                    subfolder_path = os.path.join(image_root_folder, subfolder_name)
                     duration_per_image = total_duration / num_images
-
-                    self.log_itv(
-                        f"\n--- 处理指令 {idx + 1}: 从文件夹 '{subfolder_name}' 取 {num_images} 张图, 每张 {duration_per_image:.2f}s ---")
+                    if not is_single_mode: self.log_itv(
+                        f"\n--- 处理指令 {idx + 1}: 从文件夹 '{(idx + 1)}' 取 {num_images} 张图, 每张 {duration_per_image:.2f}s ---")
 
                     for _ in range(num_images):
                         if self.img_to_video_stop_event.is_set(): break
-                        clip_counter += 1
+                        clip_counter += 1;
+                        chosen_image_path = None
+                        if is_single_mode:
+                            if not image_pool: self.log_itv(
+                                "  -> ❌ 错误: 可用图片已用尽。"); self.img_to_video_stop_event.set(); break
+                            chosen_image_path = image_pool.pop(0)
+                        else:
+                            subfolder_path = os.path.join(image_root_folder, str(idx + 1))
+                            available_in_sub = [f for f in os.listdir(subfolder_path) if f.lower().endswith(image_ext)]
+                            if not available_in_sub: self.log_itv(
+                                f"  -> ❌ 错误: 子文件夹 '{(idx + 1)}' 图片已用尽。"); self.img_to_video_stop_event.set(); break
+                            chosen_image_path = os.path.join(subfolder_path, random.choice(available_in_sub))
 
-                        available_images = [f for f in os.listdir(subfolder_path) if f.lower().endswith(image_ext)]
-                        chosen_image_name = random.choice(available_images)
-                        chosen_image_path = os.path.join(subfolder_path, chosen_image_name)
-                        self.log_itv(f"  -> 随机选择图片: {chosen_image_name}")
-
+                        self.log_itv(f"  -> 选用图片: {os.path.basename(chosen_image_path)}")
                         temp_output_path = os.path.join(temp_dir, f"temp_{clip_counter:03d}.mp4")
 
-                        final_clip_part = None
-                        try:
-                            self.log_itv(f"  -> 使用MoviePy生成平滑缩放动画...")
+                        # --- **修改**: 将新参数传递给worker函数 ---
+                        success = self._itv_worker_ffmpeg(
+                            chosen_image_path, temp_output_path, duration_per_image,
+                            use_gpu, zoom_amplitude, zoom_speed
+                        )
+                        # --- **修改结束** ---
 
-                            base_clip = ImageClip(chosen_image_path, duration=duration_per_image)
-
-                            # --- 核心修改：全新的动画逻辑 ---
-
-                            # 1. 预处理：计算缩放系数，让图片能铺满 1080x1920 的屏幕 (消除黑边)
-                            img_w, img_h = base_clip.size
-                            target_w, target_h = 1080, 1920
-                            # 计算能覆盖目标的最小缩放比例
-                            scale_factor = max(target_w / img_w, target_h / img_h)
-                            fitted_clip = base_clip.resize(scale_factor)
-
-                            # 2. 定义“先放大再缩小”的动画函数
-                            # 我们使用 sin 函数来创造一个平滑的、从0到1再回到0的曲线
-                            # t 是当前时间, duration_per_image 是片段总时长
-                            def resize_func(t):
-                                # 动画幅度，表示在中间点最大放大8%
-                                amplitude = 0.08
-                                # math.sin 在 0 到 pi 之间会画出一条完美的拱形曲线
-                                zoom_factor = 1 + amplitude * math.sin(math.pi * t / duration_per_image)
-                                return zoom_factor
-
-                            # 3. 应用动画效果
-                            animated_clip = fitted_clip.resize(resize_func)
-
-                            # 4. 将动画剪辑放入最终画布中并居中
-                            final_clip_part = CompositeVideoClip([animated_clip.set_position("center")],
-                                                                 size=(1080, 1920))
-                            final_clip_part.duration = duration_per_image
-                            final_clip_part.fps = 30
-
-                            # 写入临时文件
-                            final_clip_part.write_videofile(temp_output_path, codec="libx264", preset='ultrafast',
-                                                            threads=4, logger=None)
-
+                        if success:
                             temp_clip_paths.append(temp_output_path)
                             os.remove(chosen_image_path)
-                            self.log_itv(f"  -> ✅ 片段 {clip_counter} 编码成功，并已删除源图片。")
+                            self.log_itv(f"  -> ✅ 片段 {clip_counter} 高速生成成功，已删除源图片。")
+                        else:
+                            self.log_itv(f"  -> ❌ 片段 {clip_counter} 生成失败，跳过此图片。")
 
-                        except Exception as e:
-                            self.log_itv(f"  -> ❌ 错误: MoviePy编码片段失败: {e}")
-                            traceback.print_exc()
-                            continue
-                        finally:
-                            if 'base_clip' in locals() and base_clip: base_clip.close()
-                            if 'final_clip_part' in locals() and final_clip_part: final_clip_part.close()
-                            gc.collect()
+                if self.img_to_video_stop_event.is_set(): shutil.rmtree(temp_dir); break
+                if not temp_clip_paths: self.log_itv("  -> 警告: 没有可供拼接的视频片段，跳过此任务。"); shutil.rmtree(
+                    temp_dir); continue
 
-                if self.img_to_video_stop_event.is_set():
-                    shutil.rmtree(temp_dir);
-                    continue
-
-                # --- 阶段二: 高速拼接 (逻辑不变) ---
                 self.log_itv("\n--- 所有片段处理完毕，开始高速拼接最终视频... ---")
-
                 concat_list_path = os.path.join(temp_dir, "concat_list.txt")
                 with open(concat_list_path, 'w', encoding='utf-8') as f:
                     for path in temp_clip_paths:
@@ -807,23 +945,20 @@ class App(ctk.CTk):
                         f.write(f"file '{safe_path}'\n")
 
                 preset_title = self.itv_preset_menu.get().replace(" ", "_")
-                output_filename = f"{preset_title}_{int(time.time())}.mp4"
-                final_output_path = os.path.join(group_output_folder, output_filename)
-
+                output_filename = f"{preset_title}_{int(time.time())}_{loop_index}.mp4"
+                final_output_path = os.path.join(final_base_folder, output_filename)
                 concat_command_string = f'"{ffmpeg_path}" -y -f concat -safe 0 -i "{concat_list_path}" -c copy "{final_output_path}"'
-
                 try:
                     subprocess.run(concat_command_string, shell=True, check=True, capture_output=True, text=True,
                                    encoding='utf-8', errors='ignore')
-                    self.log_itv(f"✅ 第 {group_num} 组视频生成完毕！已保存至: {final_output_path}")
+                    log_msg = f"视频生成完毕！" if is_single_mode else f"第 {loop_index} 组视频生成完毕！"
+                    self.log_itv(f"✅ {log_msg}已保存至: {final_output_path}")
                 except subprocess.CalledProcessError as e_concat:
                     self.log_itv(f"  -> ❌ 错误: FFmpeg拼接失败: {e_concat.stderr.strip()}")
-
                 shutil.rmtree(temp_dir)
 
             if not self.img_to_video_stop_event.is_set():
-                self.log_itv("\n🎉🎉🎉 所有组别任务处理完毕！ 🎉🎉🎉")
-
+                self.log_itv("\n🎉🎉🎉 所有任务处理完毕！ 🎉🎉🎉")
         except Exception as e:
             self.log_itv(f"发生未预料的严重错误: {e}")
             traceback.print_exc()
@@ -2851,8 +2986,10 @@ class App(ctk.CTk):
             # 禁用新的输入
             for widget in self.single_base_folder_row.winfo_children():
                 widget.configure(state="disabled")
+
     def run_video_logic_hybrid(self):
         try:
+            # --- 1. 获取所有UI输入和配置 ---
             config = self.get_video_config_from_gui()
             if not config: self.after(0, self._reset_video_buttons); return
 
@@ -2869,7 +3006,12 @@ class App(ctk.CTk):
                 return
 
             durations_str = self.video_durations_entry.get()
-            durations_list = [self._safe_float_convert(d, 0) for d in durations_str.split('.') if d.strip()]
+            # --- 新增逻辑：判断用户是否输入了时长 ---
+            is_duration_specified = bool(durations_str.strip())
+
+            durations_list = []
+            if is_duration_specified:
+                durations_list = [self._safe_float_convert(d, 0) for d in durations_str.split('.') if d.strip()]
 
             all_original_videos = [os.path.join(video_folder, f) for f in os.listdir(video_folder) if
                                    f.lower().endswith(('.mp4', '.mov', '.avi'))]
@@ -2877,7 +3019,7 @@ class App(ctk.CTk):
                 self.log_video("错误: 视频文件夹中没有任何视频文件。");
                 return
 
-            # --- 统一的模式判断与预检逻辑 ---
+            # --- 2. 统一的模式判断与预检逻辑 ---
             group_names = []
             num_groups_str = self.video_num_groups_entry.get().strip()
             phone_serials_str = self.video_phone_serial_entry.get().strip()
@@ -2894,20 +3036,20 @@ class App(ctk.CTk):
                     self.log_video(f"组数模式激活，将创建 {len(group_names)} 个文件夹。")
                 except ValueError:
                     self.log_video("错误: '生成组数' 必须是一个有效的正整数。");
-                    self.after(0,
-                               self._reset_video_buttons);
+                    self.after(0, self._reset_video_buttons);
                     return
             else:
                 self.log_video("错误: '生成组数' 或 '手机序号' 必须填写一个。");
                 self.after(0, self._reset_video_buttons);
                 return
 
-            # 只有在顺序模式下，才需要严格检查视频数量
-            if not is_remix_mode:
+            # --- 修改后的视频数量检查逻辑 ---
+            # 如果不是“按时长混剪”模式 (即 顺序模式 或 时长为空的混剪模式)，则需要严格检查视频数量
+            if not (is_remix_mode and is_duration_specified):
                 total_videos_needed = len(group_names) * len(text_lines)
                 if len(all_original_videos) < total_videos_needed:
                     self.log_video(
-                        f"错误: 视频不足！需要 {total_videos_needed} 个, 但只有 {len(all_original_videos)} 个。");
+                        f"错误: 视频不足！当前模式需要 {total_videos_needed} 个视频, 但只有 {len(all_original_videos)} 个。");
                     self.after(0, self._reset_video_buttons);
                     return
 
@@ -2917,7 +3059,7 @@ class App(ctk.CTk):
             random.shuffle(all_original_videos)
             video_pool = list(all_original_videos)
 
-            # --- 核心修复：统一的主处理循环 ---
+            # --- 3. 统一的主处理循环 ---
             for idx, group_name in enumerate(group_names):
                 if self.video_stop_event.is_set(): break
 
@@ -2925,90 +3067,90 @@ class App(ctk.CTk):
                 os.makedirs(group_folder, exist_ok=True)
                 self.log_video(f"\n---=== 开始处理组: {group_name} ===---")
 
-                # 内层循环，遍历每一行文案
                 for j, text_line in enumerate(text_lines):
                     if self.video_stop_event.is_set(): break
 
                     input_video_path = None
                     temp_files_for_this_task = []
-                    is_current_task_remix = False
-                    originals_to_delete_in_remix = []  # 新增: 保存本次混剪用到的原始视频
+                    is_current_task_remix_clip = False  # 用于区分是“混剪片段”还是“单个视频”
+                    originals_to_delete_in_remix = []
 
-                    # 彻底修复误删文件的关键点
                     try:
                         if is_remix_mode:
-                            # 混剪模式：为当前文案动态生成一个混剪视频
-                            if j >= len(durations_list):
-                                self.log_video(
-                                    f"  -> 警告: 时长列表数量少于文案行数，第 {j + 1} 条文案缺少对应时长，已跳过。")
-                                continue
-                            target_duration = durations_list[j] + 1
-                            # 修改: 接收返回的第三个值
-                            input_video_path, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_clip(
-                                target_duration,
-                                video_pool,
-                                group_folder,
-                                self.log_video)
-                            if not input_video_path:
-                                self.log_video(f"  ❌ 错误: 为文案 '{text_line[:10]}...' 创建混剪视频失败，跳过此任务。")
-                                continue
-                            temp_files_for_this_task.extend(temp_files_from_remix)
-                            temp_files_for_this_task.append(input_video_path)  # 混剪出的视频也是临时文件
-                            is_current_task_remix = True
+                            # --- 新逻辑分支：根据是否输入时长来决定行为 ---
+                            if is_duration_specified:
+                                # --- 行为1: 用户输入了时长，执行原有的混剪逻辑 ---
+                                self.log_video(f"  -> [模式] 按时长混剪")
+                                if j >= len(durations_list):
+                                    self.log_video(f"  -> 警告: 时长列表数量不足，跳过文案 '{text_line[:10]}...'")
+                                    continue
+                                target_duration = durations_list[j]
+                                input_video_path, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_clip(
+                                    target_duration, video_pool, group_folder, self.log_video)
+                                if not input_video_path:
+                                    self.log_video(f"  ❌ 错误: 为文案 '{text_line[:10]}...' 创建混剪视频失败，跳过。")
+                                    continue
+                                temp_files_for_this_task.extend(temp_files_from_remix)
+                                temp_files_for_this_task.append(input_video_path)
+                                is_current_task_remix_clip = True
+                                duration_param = ""  # 时长已在混剪时处理完毕
+                            else:
+                                # --- 行为2: 用户未输入时长，执行新的“一文案一视频”逻辑 ---
+                                self.log_video(f"  -> [模式] 时长为空，随机抽取完整视频")
+                                if not video_pool:
+                                    self.log_video(f"  ❌ 错误: 视频池已空，无法为文案 '{text_line[:10]}...' 分配视频。")
+                                    continue
+
+                                # 从视频池中随机抽取一个视频，并移除，防止重复使用
+                                input_video_path = video_pool.pop(random.randrange(len(video_pool)))
+                                duration_param = ""  # 使用完整时长
+                                is_current_task_remix_clip = False
                         else:
-                            # 顺序模式：按顺序取一个视频
+                            # --- 行为3: 顺序模式（非混剪）---
+                            self.log_video(f"  -> [模式] 顺序处理")
                             video_index = idx * len(text_lines) + j
-                            # 检查video_pool是否足够
                             if video_index >= len(video_pool):
-                                self.log_video(
-                                    f"  ❌ 错误: 视频池中视频不足，无法继续。需要索引 {video_index}，但池大小为 {len(video_pool)}。")
-                                # 强制停止所有后续任务
-                                self.video_stop_event.set()
+                                self.log_video(f"  ❌ 错误: 视频池中视频不足，任务中止。")
+                                self.video_stop_event.set();
                                 break
                             input_video_path = video_pool[video_index]
-
-                        # 准备时长参数
-                        duration_param = ""
-                        if durations_list and not is_remix_mode:
-                            current_duration = durations_list[j % len(durations_list)]
-                            if current_duration > 0:
-                                adjusted_duration = current_duration
-                                duration_param = f"-to {adjusted_duration}"
-                                self.log_video(f"  -> 将应用时长: {adjusted_duration}s")
+                            is_current_task_remix_clip = False
+                            # 为顺序模式设置时长参数
+                            duration_param = ""
+                            if durations_list:
+                                current_duration = durations_list[j % len(durations_list)]
+                                if current_duration > 0:
+                                    duration_param = f"-to {current_duration}"
+                                    self.log_video(f"  -> 将应用时长: {current_duration}s")
 
                         # 统一调用处理函数
                         output_name = f"{group_name}_{j + 1}.mp4"
                         self._apply_text_to_video(input_video_path, group_folder, output_name, text_line, config,
-                                                  use_gpu,
-                                                  duration_param, temp_files_for_this_task)
+                                                  use_gpu, duration_param, temp_files_for_this_task)
 
                     except Exception as e:
                         self.log_video(
-                            f"  -> ❌ 处理视频 {os.path.basename(input_video_path)} 时发生致命错误，文件未被删除。")
+                            f"  -> ❌ 处理视频 {os.path.basename(input_video_path or '未知')} 时发生致命错误: {e}")
 
                     else:
-                        # 仅在 try 块没有发生任何错误时，才执行这里的代码
-                        if not is_remix_mode and input_video_path and os.path.exists(input_video_path):
+                        # --- 修改后的删除逻辑 ---
+                        if is_current_task_remix_clip:
+                            # 如果是“按时长混剪”出的片段，则删除用过的原始视频
+                            self.log_video(f"  -> [混剪] 正在删除本次混剪使用过的源视频...")
+                            for original_path in originals_to_delete_in_remix:
+                                if os.path.exists(original_path):
+                                    try:
+                                        os.remove(original_path); self.log_video(
+                                            f"    -> ✅ 已删除: {os.path.basename(original_path)}")
+                                    except OSError as e:
+                                        self.log_video(f"    -> ❌ 删除失败: {e}")
+                        elif input_video_path and os.path.exists(input_video_path):
+                            # 如果是“顺序模式”或“时长为空的混剪模式”，则直接删除用掉的那个视频
                             try:
                                 os.remove(input_video_path)
                                 self.log_video(f"  -> ✅ 源视频已删除: {os.path.basename(input_video_path)}")
                             except OSError as e:
                                 self.log_video(f"  -> ❌ 删除源视频时发生异常: {e}")
-
-                        # 新增: 混剪模式下的删除逻辑
-                        elif is_remix_mode:
-                            self.log_video(f"  -> [混剪] 正在删除本次混剪使用过的源视频...")
-                            for original_path in originals_to_delete_in_remix:
-                                if os.path.exists(original_path):
-                                    try:
-                                        os.remove(original_path)
-                                        # 同时从主视频池中移除，防止后续任务出错
-                                        if original_path in video_pool:
-                                            video_pool.remove(original_path)
-                                        self.log_video(f"    -> ✅ 已删除: {os.path.basename(original_path)}")
-                                    except OSError as e:
-                                        self.log_video(
-                                            f"    -> ❌ 删除源视频 {os.path.basename(original_path)} 时发生异常: {e}")
 
             if not self.video_stop_event.is_set():
                 self.log_video("\n---=== 所有任务处理完毕！ ===---")
@@ -3191,8 +3333,31 @@ class App(ctk.CTk):
     def log_composite(self, message, clear=False):
         self.after(0, self._update_log, self.composite_log_textbox, message, clear)
 
-    def setup_greenscreen_composite_workflow(self):
-        """创建“绿幕合成”功能的UI界面 (恢复混剪开关并修正布局)"""
+    def _toggle_composite_mode_widgets(self):
+        """根据'单一模式'开关的状态，启用或禁用绿幕合成中的相关UI控件。"""
+        if not all(hasattr(self, attr) for attr in [
+            'composite_single_mode_switch', 'composite_num_groups_entry',
+            'composite_phone_serial_entry', 'composite_remix_switch'
+        ]):
+            return
+
+        is_single_mode = self.composite_single_mode_switch.get() == 1
+
+        if is_single_mode:
+            # 单一模式开启：禁用多模式相关控件
+            self.composite_num_groups_entry.configure(state="disabled")
+            self.composite_phone_serial_entry.configure(state="disabled")
+            self.composite_remix_switch.configure(state="disabled")
+            self.composite_remix_switch.deselect()  # 同时取消勾选
+        else:
+            # 单一模式关闭：恢复多模式相关控件
+            self._update_exclusive_entry_state(
+                self.composite_phone_serial_entry, self.composite_num_groups_entry
+            )
+            self.composite_remix_switch.configure(state="normal")
+
+    def setup_greenscreen_composite_workflow(self, parent_tab):
+        """创建“绿幕合成”功能的UI界面 (新增单一模式开关)"""
         tab = self.main_tabview.tab("绿幕合成")
 
         main_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -3210,47 +3375,51 @@ class App(ctk.CTk):
         settings_frame.pack(fill="x", pady=(15, 5), ipady=10)
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(settings_frame, text="生成组数:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        # --- 新增: 单一模式开关 ---
+        self.composite_single_mode_switch = ctk.CTkSwitch(settings_frame,
+                                                          text="单一模式 (一个绿幕视频 vs 多个背景视频)",
+                                                          command=self._toggle_composite_mode_widgets)
+        self.composite_single_mode_switch.grid(row=0, column=0, columnspan=2, padx=10, pady=(5, 10), sticky="w")
+
+        # --- 原有控件 (行号相应增加) ---
+        ctk.CTkLabel(settings_frame, text="生成组数:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.composite_num_groups_entry = ctk.CTkEntry(settings_frame)
         self.composite_num_groups_entry.insert(0, "1")
-        self.composite_num_groups_entry.grid(row=0, column=1, padx=10, pady=5, sticky="ew")
+        self.composite_num_groups_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
 
-        ctk.CTkLabel(settings_frame, text="手机序号(用.分隔):").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(settings_frame, text="手机序号(用.分隔):").grid(row=2, column=0, padx=10, pady=5, sticky="w")
         self.composite_phone_serial_entry = ctk.CTkEntry(settings_frame, placeholder_text="例如: A-1.A-2.B-1")
-        self.composite_phone_serial_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+        self.composite_phone_serial_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
 
         self.composite_num_groups_entry.bind("<KeyRelease>", lambda event: self._update_exclusive_entry_state(
             self.composite_num_groups_entry, self.composite_phone_serial_entry))
         self.composite_phone_serial_entry.bind("<KeyRelease>", lambda event: self._update_exclusive_entry_state(
             self.composite_phone_serial_entry, self.composite_num_groups_entry))
 
-        # --- [核心修改] 恢复“随机拼接”开关 ---
         self.composite_remix_switch = ctk.CTkSwitch(settings_frame, text="开启随机拼接模式 (背景由多片段合成)")
-        self.composite_remix_switch.grid(row=2, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="w")
-        # --- 修改结束 ---
+        self.composite_remix_switch.grid(row=3, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="w")
 
         calibrate_button = ctk.CTkButton(settings_frame, text="校准颜色 (推荐)", command=self.composite_calibrate_color)
-        calibrate_button.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+        calibrate_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
         self.composite_color_status_label = ctk.CTkLabel(settings_frame, text="颜色: 默认标准绿", text_color="orange")
-        self.composite_color_status_label.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+        self.composite_color_status_label.grid(row=4, column=1, padx=10, pady=5, sticky="w")
 
-        # ... 后续其他UI控件保持不变 ...
-        ctk.CTkLabel(settings_frame, text="相似度 (0.01-1.0):").grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(settings_frame, text="相似度 (0.01-1.0):").grid(row=5, column=0, padx=10, pady=5, sticky="w")
         self.gs_composite_similarity_slider = ctk.CTkSlider(settings_frame, from_=0.01, to=1.0, number_of_steps=99)
         self.gs_composite_similarity_slider.set(0.2)
-        self.gs_composite_similarity_slider.grid(row=4, column=1, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(settings_frame, text="边缘羽化 (0.0-1.0):").grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        self.gs_composite_similarity_slider.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(settings_frame, text="边缘羽化 (0.0-1.0):").grid(row=6, column=0, padx=10, pady=5, sticky="w")
         self.gs_composite_blend_slider = ctk.CTkSlider(settings_frame, from_=0.0, to=1.0, number_of_steps=100)
         self.gs_composite_blend_slider.set(0.1)
-        self.gs_composite_blend_slider.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(settings_frame, text="去绿边强度 (0.0-1.0):").grid(row=6, column=0, padx=10, pady=5, sticky="w")
+        self.gs_composite_blend_slider.grid(row=6, column=1, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(settings_frame, text="去绿边强度 (0.0-1.0):").grid(row=7, column=0, padx=10, pady=5, sticky="w")
         self.gs_composite_despill_slider = ctk.CTkSlider(settings_frame, from_=0.0, to=1.0, number_of_steps=100)
         self.gs_composite_despill_slider.set(0.5)
-        self.gs_composite_despill_slider.grid(row=6, column=1, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(settings_frame, text="输出质量 (CRF/CQ):").grid(row=7, column=0, padx=10, pady=5, sticky="w")
+        self.gs_composite_despill_slider.grid(row=7, column=1, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(settings_frame, text="输出质量 (CRF/CQ):").grid(row=8, column=0, padx=10, pady=5, sticky="w")
         self.gs_composite_quality_slider = ctk.CTkSlider(settings_frame, from_=18, to=30, number_of_steps=12)
         self.gs_composite_quality_slider.set(24)
-        self.gs_composite_quality_slider.grid(row=7, column=1, padx=10, pady=5, sticky="ew")
+        self.gs_composite_quality_slider.grid(row=8, column=1, padx=10, pady=5, sticky="ew")
         self.gs_composite_use_gs_audio_switch = ctk.CTkSwitch(settings_frame,
                                                               text="使用绿幕视频的音频 (默认使用背景音频)")
         self.gs_composite_use_gs_audio_switch.grid(row=9, column=0, columnspan=2, padx=10, pady=(15, 5), sticky="w")
@@ -3277,6 +3446,9 @@ class App(ctk.CTk):
         self.composite_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
         self.composite_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
         self.composite_log_textbox.pack(expand=True, fill="both", pady=(10, 5))
+
+        # 初始化UI控件状态
+        self._toggle_composite_mode_widgets()
 
     def _create_random_remix_background(self, bg_video_pool, target_duration, temp_dir):
         """为混剪模式生成一个随机拼接的背景视频 (修改版：返回用过的原始文件列表)"""
@@ -3723,16 +3895,15 @@ class App(ctk.CTk):
         cv2.destroyAllWindows()
 
     def run_composite_logic(self):
-        """【全新随机逻辑版 + 删除源文件】绿幕合成 (集成了随机配对和随机混剪)"""
+        """【新增单一模式】绿幕合成主逻辑 (集成了随机配对、随机混剪和单一模式)"""
         temp_files_to_clean = []
         try:
             # 1. --- 获取所有UI配置 ---
             source_folder = self.gs_composite_source_folder_entry.get()
             bg_folder = self.gs_composite_bg_folder_entry.get()
             output_folder = self.gs_composite_output_folder_entry.get()
-            is_remix_mode = self.composite_remix_switch.get() == 1  # 读取新开关的状态
+            is_single_mode = self.composite_single_mode_switch.get() == 1
 
-            # 获取通用参数 (这部分不变)
             key_color = (self.selected_hex_color if self.selected_hex_color else "#00FF00").lstrip('#')
             similarity = self.gs_composite_similarity_slider.get()
             blend = self.gs_composite_blend_slider.get()
@@ -3756,121 +3927,134 @@ class App(ctk.CTk):
             if not ffmpeg_path or not ffprobe_path: self.log_composite(
                 "❌ 错误: 找不到 ffmpeg.exe 或 ffprobe.exe"); return
 
-            # 3. --- 解析组数/手机序号 ---
-            num_groups_str = self.composite_num_groups_entry.get().strip()
-            phone_serials_str = self.composite_phone_serial_entry.get().strip()
-            group_names = []
-            if phone_serials_str:
-                group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
-                if not group_names: self.log_composite("错误: 手机序号输入无效。"); return
-            elif num_groups_str:
-                try:
-                    num_groups = int(num_groups_str);
-                    if num_groups <= 0: raise ValueError
-                    group_names = [f"group_{i + 1}" for i in range(num_groups)]
-                except (ValueError, TypeError):
-                    self.log_composite("错误: '生成组数' 必须是一个有效的正整数。");
+            # 3. --- 根据模式选择不同逻辑分支 ---
+            if is_single_mode:
+                # --- [新功能] 单一模式逻辑 ---
+                self.log_composite("▶️ 模式: 单一模式 (一个绿幕 vs 多个背景)")
+                if len(source_videos) != 1:
+                    self.log_composite(
+                        f"❌ 错误: 单一模式要求绿幕文件夹中必须有且仅有 1 个视频文件，但找到了 {len(source_videos)} 个。")
                     return
-            else:
-                self.log_composite("错误: '生成组数' 或 '手机序号' 必须填写一个。");
-                return
 
-            self.log_composite(f"▶️ 模式: {'随机混剪 (拼接背景)' if is_remix_mode else '随机配对 (单个背景)'}")
-            self.log_composite(
-                f"▶️ 将为 {len(source_videos)} 个绿幕视频，生成 {len(group_names)} 组，总计 {len(source_videos) * len(group_names)} 个结果视频。")
-            # <--- 新增：添加删除警告 --->
-            if is_remix_mode:
-                self.log_composite("⚠️ 警告: 随机拼接模式已启用，处理成功后，用过的原始背景视频将被删除！")
+                single_gs_video = source_videos[0]
+                total_tasks = len(background_videos)
+                self.log_composite(
+                    f"▶️ 将使用绿幕视频 '{os.path.basename(single_gs_video)}' 与 {total_tasks} 个背景视频进行合成。")
+                if os.path.exists(output_folder): shutil.rmtree(output_folder)
+                os.makedirs(output_folder)
 
-            # 4. --- 全新的主处理循环 ---
-            total_tasks = len(source_videos) * len(group_names)
-            task_count = 0
-
-            # 外层循环：遍历组名
-            for group_name in group_names:
-                if self.composite_stop_event.is_set(): break
-                group_output_folder = os.path.join(output_folder, group_name)
-                os.makedirs(group_output_folder, exist_ok=True)
-                self.log_composite(f"\n--- [开始处理组: {group_name}] ---")
-
-                # 内层循环：遍历每一个绿幕视频
-                for src_path in source_videos:
+                for i, bg_path in enumerate(background_videos):
                     if self.composite_stop_event.is_set(): break
-                    task_count += 1
-                    self.log_composite(f"\n--- [总任务 {task_count}/{total_tasks}] ---")
-                    self.log_composite(f"  绿幕: {os.path.basename(src_path)}")
+                    self.log_composite(f"\n--- [任务 {i + 1}/{total_tasks}] ---")
+                    self.log_composite(f"  绿幕: {os.path.basename(single_gs_video)}")
+                    self.log_composite(f"  背景: {os.path.basename(bg_path)}")
 
-                    bg_to_use = None
-                    # <--- 新增：为删除逻辑初始化列表 --->
-                    originals_to_delete_in_remix = []
+                    src_basename = os.path.splitext(os.path.basename(single_gs_video))[0]
+                    bg_basename = os.path.splitext(os.path.basename(bg_path))[0]
+                    output_filename = f"{src_basename}_on_{bg_basename}.mp4"
+                    output_filepath = os.path.join(output_folder, output_filename)
 
+                    self._perform_single_composite(
+                        ffmpeg_path, ffprobe_path, bg_path, single_gs_video, output_filepath,
+                        key_color, similarity, blend, despill_amount, quality_val,
+                        use_gpu, use_gs_audio, do_freeze, freeze_duration
+                    )
+            else:
+                # --- 原始的多模式逻辑 ---
+                is_remix_mode = self.composite_remix_switch.get() == 1
+                num_groups_str = self.composite_num_groups_entry.get().strip()
+                phone_serials_str = self.composite_phone_serial_entry.get().strip()
+                group_names = []
+                if phone_serials_str:
+                    group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
+                    if not group_names: self.log_composite("错误: 手机序号输入无效。"); return
+                elif num_groups_str:
                     try:
-                        # 这是核心区别点：根据开关选择不同的背景生成方式
-                        if is_remix_mode:
-                            # 检查背景素材是否足够
-                            if not background_videos:
-                                self.log_composite(f"  -> ❌ 错误: 背景素材库已用尽，无法继续混剪，任务中止。")
-                                self.composite_stop_event.set()  # 强制停止所有后续任务
-                                break
+                        num_groups = int(num_groups_str);
+                        if num_groups <= 0: raise ValueError
+                        group_names = [f"group_{i + 1}" for i in range(num_groups)]
+                    except (ValueError, TypeError):
+                        self.log_composite("错误: '生成组数' 必须是一个有效的正整数。");
+                        return
+                else:
+                    self.log_composite("错误: '生成组数' 或 '手机序号' 必须填写一个。");
+                    return
 
-                            # 开关ON: 随机拼接模式
-                            cmd_probe_gs = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
-                                            "default=noprint_wrappers=1:nokey=1", os.path.normpath(src_path)]
-                            result = subprocess.run(cmd_probe_gs, check=True, capture_output=True, text=True)
-                            gs_duration = float(result.stdout.strip())
-                            if gs_duration <= 0: self.log_composite(f"  -> 警告: 绿幕视频时长为0，已跳过。"); continue
+                self.log_composite(f"▶️ 模式: {'随机混剪 (拼接背景)' if is_remix_mode else '随机配对 (单个背景)'}")
+                self.log_composite(
+                    f"▶️ 将为 {len(source_videos)} 个绿幕视频，生成 {len(group_names)} 组，总计 {len(source_videos) * len(group_names)} 个结果视频。")
+                if is_remix_mode:
+                    self.log_composite("⚠️ 警告: 随机拼接模式已启用，处理成功后，用过的原始背景视频将被删除！")
 
-                            # <--- 核心修改：接收第三个返回值 --->
-                            bg_to_use, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_background(
-                                background_videos,
-                                gs_duration,
-                                group_output_folder)
-                            temp_files_to_clean.extend(temp_files_from_remix)
-                            if not bg_to_use: self.log_composite(f"  -> ❌ 错误: 无法创建混剪背景，跳过此任务。"); continue
+                total_tasks = len(source_videos) * len(group_names)
+                task_count = 0
 
-                        else:
-                            # 开关OFF: 随机配对模式
-                            bg_to_use = random.choice(background_videos)
-                            self.log_composite(f"  -> 随机配对背景: {os.path.basename(bg_to_use)}")
+                for group_name in group_names:
+                    if self.composite_stop_event.is_set(): break
+                    group_output_folder = os.path.join(output_folder, group_name)
+                    os.makedirs(group_output_folder, exist_ok=True)
+                    self.log_composite(f"\n--- [开始处理组: {group_name}] ---")
 
-                        # 定义输出文件名
-                        src_basename = os.path.splitext(os.path.basename(src_path))[0]
-                        bg_basename = os.path.splitext(os.path.basename(bg_to_use))[0]
-                        output_filename = f"{src_basename}_on_{bg_basename}.mp4"
-                        output_filepath = os.path.join(group_output_folder, output_filename)
+                    for src_path in source_videos:
+                        if self.composite_stop_event.is_set(): break
+                        task_count += 1
+                        self.log_composite(f"\n--- [总任务 {task_count}/{total_tasks}] ---")
+                        self.log_composite(f"  绿幕: {os.path.basename(src_path)}")
 
-                        # 调用统一的合成函数
-                        self._perform_single_composite(
-                            ffmpeg_path, ffprobe_path, bg_to_use, src_path, output_filepath,
-                            key_color, similarity, blend, despill_amount, quality_val,
-                            use_gpu, use_gs_audio, do_freeze, freeze_duration
-                        )
+                        bg_to_use = None;
+                        originals_to_delete_in_remix = []
+                        try:
+                            if is_remix_mode:
+                                if not background_videos:
+                                    self.log_composite(f"  -> ❌ 错误: 背景素材库已用尽，无法继续混剪，任务中止。")
+                                    self.composite_stop_event.set();
+                                    break
+                                cmd_probe_gs = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
+                                                "default=noprint_wrappers=1:nokey=1", os.path.normpath(src_path)]
+                                result = subprocess.run(cmd_probe_gs, check=True, capture_output=True, text=True)
+                                gs_duration = float(result.stdout.strip())
+                                if gs_duration <= 0: self.log_composite(f"  -> 警告: 绿幕视频时长为0，已跳过。"); continue
+                                bg_to_use, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_background(
+                                    background_videos, gs_duration, group_output_folder)
+                                temp_files_to_clean.extend(temp_files_from_remix)
+                                if not bg_to_use: self.log_composite(
+                                    f"  -> ❌ 错误: 无法创建混剪背景，跳过此任务。"); continue
+                            else:
+                                bg_to_use = random.choice(background_videos)
+                                self.log_composite(f"  -> 随机配对背景: {os.path.basename(bg_to_use)}")
 
-                        # <--- 核心修改：在这里执行删除逻辑 --->
-                        if is_remix_mode:
-                            self.log_composite("  -> [混剪] 正在删除本次使用过的源背景视频...")
-                            for original_path in originals_to_delete_in_remix:
-                                if original_path in background_videos:
-                                    try:
-                                        os.remove(original_path)
-                                        background_videos.remove(original_path)  # 从主素材池移除
-                                        self.log_composite(f"    -> 🗑️ 已删除: {os.path.basename(original_path)}")
-                                    except OSError as e:
-                                        self.log_composite(
-                                            f"    -> ❌ 删除源文件 {os.path.basename(original_path)} 失败: {e}")
+                            src_basename = os.path.splitext(os.path.basename(src_path))[0]
+                            bg_basename = os.path.splitext(os.path.basename(bg_to_use))[0]
+                            output_filename = f"{src_basename}_on_{bg_basename}.mp4"
+                            output_filepath = os.path.join(group_output_folder, output_filename)
 
-                    except Exception as e:
-                        self.log_composite(f"  ❌ 任务失败: {e}")
-                    finally:
-                        # 如果是混剪模式，bg_to_use是临时文件，需要清理
-                        if is_remix_mode and bg_to_use and os.path.exists(bg_to_use):
-                            temp_files_to_clean.append(bg_to_use)
+                            self._perform_single_composite(
+                                ffmpeg_path, ffprobe_path, bg_to_use, src_path, output_filepath,
+                                key_color, similarity, blend, despill_amount, quality_val,
+                                use_gpu, use_gs_audio, do_freeze, freeze_duration
+                            )
+
+                            if is_remix_mode:
+                                self.log_composite("  -> [混剪] 正在删除本次使用过的源背景视频...")
+                                for original_path in originals_to_delete_in_remix:
+                                    if original_path in background_videos:
+                                        try:
+                                            os.remove(original_path)
+                                            background_videos.remove(original_path)
+                                            self.log_composite(f"    -> 🗑️ 已删除: {os.path.basename(original_path)}")
+                                        except OSError as e:
+                                            self.log_composite(
+                                                f"    -> ❌ 删除源文件 {os.path.basename(original_path)} 失败: {e}")
+                        except Exception as e:
+                            self.log_composite(f"  ❌ 任务失败: {e}")
+                        finally:
+                            if is_remix_mode and bg_to_use and os.path.exists(bg_to_use):
+                                temp_files_to_clean.append(bg_to_use)
 
             if self.composite_stop_event.is_set():
                 self.log_composite("🔴 任务已中止。")
             else:
                 self.log_composite("\n--- 🎉 所有任务处理完毕！ ---")
-
         except Exception as e:
             self.log_composite(f"发生未预料的严重错误: {e}")
             traceback.print_exc()
@@ -6438,7 +6622,8 @@ class App(ctk.CTk):
             temp_output_path = os.path.join(temp_dir, f"remix_{random.randint(1000, 9999)}.mp4")
             command = [
                 ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
-                '-i', concat_list_path, '-c', 'copy', '-an',
+                '-i', concat_list_path,
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-an',
                 os.path.normpath(temp_output_path)
             ]
 
@@ -6512,9 +6697,78 @@ class App(ctk.CTk):
 
         # --- 新增：初始化UI状态 ---
         self._toggle_image_processing_mode()
+
+    def _video_delete_preset(self):
+        """删除当前在下拉菜单中选中的预设"""
+        preset_name_to_delete = self.video_preset_menu.get()
+
+        if preset_name_to_delete == "无预设":
+            tk_messagebox.showinfo("提示", "不能删除“无预设”这个占位选项。")
+            return
+
+        # 弹出确认对话框，防止误删
+        is_confirmed = tk_messagebox.askyesno(
+            "确认删除",
+            f"您确定要永久删除预设 “{preset_name_to_delete}” 吗？\n此操作无法撤销。",
+            icon='warning'
+        )
+
+        if not is_confirmed:
+            self.log_video(f"ℹ️ 已取消删除预设 ‘{preset_name_to_delete}’。")
+            return
+
+        # 确认后，执行删除操作
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+
+            # 从字典中移除对应的键
+            if preset_name_to_delete in presets:
+                del presets[preset_name_to_delete]
+
+                # 将修改后的数据写回文件
+                with open(self.VIDEO_PRESETS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(presets, f, indent=4, ensure_ascii=False)
+
+                self.log_video(f"✅ 预设 ‘{preset_name_to_delete}’ 已被成功删除。")
+                self._video_populate_presets_dropdown()  # 刷新下拉列表
+            else:
+                self.log_video(f"⚠️ 警告: 尝试删除一个不存在的预设 ‘{preset_name_to_delete}’，将刷新列表。")
+                self._video_populate_presets_dropdown()
+
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.log_video("❌ 删除失败: 找不到或无法解析预设文件。")
     def setup_video_settings_tab(self, tab):
         tab.grid_rowconfigure(0, weight=1); tab.grid_columnconfigure(0, weight=1)
         scrollable_frame = ctk.CTkScrollableFrame(tab, label_text="视频字幕的所有参数均在此配置"); scrollable_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        # --- 修改后的预设管理模块 ---
+        preset_frame = ctk.CTkFrame(scrollable_frame)
+        preset_frame.pack(fill="x", padx=10, pady=10)
+        preset_frame.grid_columnconfigure(1, weight=1)  # 让下拉框占据更多空间
+
+        ctk.CTkLabel(preset_frame, text="模式类型:").grid(row=0, column=0, padx=(10, 5), sticky="w")
+        self.video_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._video_load_preset)
+        self.video_preset_menu.grid(row=0, column=1, sticky="ew", padx=5)
+
+        self.video_save_preset_button = ctk.CTkButton(preset_frame, text="保存当前配置", width=120,
+                                                      command=self._video_save_preset)
+        self.video_save_preset_button.grid(row=0, column=2, padx=5)
+
+        # --- 新增的删除按钮 ---
+        self.video_delete_preset_button = ctk.CTkButton(preset_frame, text="删除", width=60,
+                                                        command=self._video_delete_preset, fg_color="#D32F2F",
+                                                        hover_color="#B71C1C")
+        self.video_delete_preset_button.grid(row=0, column=3, padx=(5, 10))
+        # --- UI修改结束 ---
+
+        ctk.CTkLabel(preset_frame, text="模式类型:").grid(row=0, column=0, padx=(10, 5))
+        self.video_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._video_load_preset)
+        self.video_preset_menu.grid(row=0, column=1, sticky="ew", padx=5)
+
+        self.video_save_preset_button = ctk.CTkButton(preset_frame, text="保存当前配置", width=120,
+                                                      command=self._video_save_preset)
+        self.video_save_preset_button.grid(row=0, column=2, padx=(5, 10))
+        # --- 新增结束 ---
         shared_frame = ctk.CTkFrame(scrollable_frame, border_width=1); shared_frame.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(shared_frame, text="--- 视频 · 共享样式 ---", font=ctk.CTkFont(weight="bold")).pack(pady=5)
         default_video_font_path = get_resource_path(os.path.join('assets', 'WenYue_XinQingNianTi_J-W8.otf'))
@@ -6547,12 +6801,132 @@ class App(ctk.CTk):
             self.create_color_picker_row(sub_frame, "文字颜色:", f"video_sub{i}_color_text", defaults[i-1][1])
             self.create_color_picker_row(sub_frame, "描边颜色:", f"video_sub{i}_color_stroke", defaults[i-1][2])
             self.create_color_picker_row(sub_frame, "背景颜色:", f"video_sub{i}_color_bg", defaults[i-1][3])
-        self.preview_button = ctk.CTkButton(tab, text="生成视频字幕预览", command=self.generate_video_preview); self.preview_button.grid(row=1, column=0, pady=10, padx=5)
-        self.preview_display_frame = ctk.CTkFrame(tab); self.preview_display_frame.grid_rowconfigure(1, weight=1); self.preview_display_frame.grid_columnconfigure(0, weight=1)
-        self.close_preview_button = ctk.CTkButton(self.preview_display_frame, text="关闭预览", command=self.close_video_preview, width=120); self.close_preview_button.grid(row=0, column=0, pady=(5, 10))
-        self.preview_label = ctk.CTkLabel(self.preview_display_frame, text="", text_color="gray"); self.preview_label.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        tab.grid_rowconfigure(2, weight=1); self.close_video_preview()
 
+
+    # --- 新增：视频处理预设功能模块 ---
+    def _video_populate_presets_dropdown(self):
+        """读取预设文件并更新下拉菜单"""
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+            titles = list(presets.keys())
+            if not titles: titles = ["无预设"]
+            self.video_preset_menu.configure(values=titles)
+            if titles:
+                self.video_preset_menu.set(titles[0])
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.video_preset_menu.configure(values=["无预设"])
+            self.video_preset_menu.set("无预设")
+
+    def _video_save_preset(self):
+        """保存当前视频参数配置为新预设"""
+        dialog = ctk.CTkInputDialog(text="请输入新模式的名称:", title="保存预设")
+        title = dialog.get_input()
+
+        if not title or not title.strip():
+            self.log_video("ℹ️ 保存已取消，未输入名称。")
+            return
+
+        # 1. 获取当前所有配置
+        current_config = self.get_video_config_from_gui()
+        if not current_config:
+            self.log_video("❌ 保存失败，无法获取当前配置。")
+            return
+
+        # 2. 读取现有预设
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            presets = {}
+
+        # 3. 添加或更新预设
+        presets[title] = current_config
+
+        # 4. 写回文件
+        with open(self.VIDEO_PRESETS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(presets, f, indent=4, ensure_ascii=False)
+
+        self.log_video(f"✅ 预设 '{title}' 已成功保存。")
+
+        # 5. 刷新UI
+        self._video_populate_presets_dropdown()
+        self.video_preset_menu.set(title)
+
+    def _video_load_preset(self, preset_name):
+        """根据选择的预设名称，加载并应用配置"""
+        if preset_name == "无预设":
+            return
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+
+            config = presets.get(preset_name)
+            if not config:
+                self.log_video(f"❌ 加载失败，找不到名为 '{preset_name}' 的预设。")
+                return
+
+            # 应用配置到UI
+            ss_config = config.get('共享样式', {})
+            self.video_shared_font_file_entry.delete(0, 'end');
+            self.video_shared_font_file_entry.insert(0, ss_config.get('字体文件', ''))
+            self.video_shared_size_entry.delete(0, 'end');
+            self.video_shared_size_entry.insert(0, ss_config.get('字体大小', '60'))
+            self.video_shared_max_width_ratio_entry.delete(0, 'end');
+            self.video_shared_max_width_ratio_entry.insert(0, ss_config.get('最大宽度比例', '0.9'))
+            self.video_shared_padding_horizontal_entry.delete(0, 'end');
+            self.video_shared_padding_horizontal_entry.insert(0, ss_config.get('左右内边距', '30'))
+            self.video_shared_padding_vertical_entry.delete(0, 'end');
+            self.video_shared_padding_vertical_entry.insert(0, ss_config.get('垂直内边距', '25'))
+            self.video_shared_stroke_width_entry.delete(0, 'end');
+            self.video_shared_stroke_width_entry.insert(0, ss_config.get('描边粗细', '2'))
+            self.video_shared_corner_radius_entry.delete(0, 'end');
+            self.video_shared_corner_radius_entry.insert(0, ss_config.get('背景圆角半径', '20'))
+
+            if ss_config.get('禁用背景', False):
+                self.video_no_bg_switch.select()
+            else:
+                self.video_no_bg_switch.deselect()
+
+            if ss_config.get('启用逐行背景', False):
+                self.video_line_by_line_bg_switch.select()
+            else:
+                self.video_line_by_line_bg_switch.deselect()
+
+            main_config = config.get('主文案', {})
+            main_pos = main_config.get('位置', {})
+            self.video_main_pos_x_entry.delete(0, 'end');
+            self.video_main_pos_x_entry.insert(0, main_pos.get('水平位置 (x)', 'center'))
+            self.video_main_pos_y_entry.delete(0, 'end');
+            self.video_main_pos_y_entry.insert(0, main_pos.get('垂直位置 (y)', '150'))
+
+            main_colors = main_config.get('颜色', {})
+            self._update_color_widget('video_main_color_text', main_colors.get('文字颜色', 'white'))
+            self._update_color_widget('video_main_color_stroke', main_colors.get('描边颜色', 'black'))
+            self._update_color_widget('video_main_color_bg', main_colors.get('背景颜色', 'rgba(0,0,0,0.5)'))
+
+            sub_configs = config.get('次文案', [{}, {}])
+            if len(sub_configs) > 0:
+                sub1_config = sub_configs[0]
+                self.video_sub1_offset_y_entry.delete(0, 'end');
+                self.video_sub1_offset_y_entry.insert(0, sub1_config.get('相对Y轴偏移', '20'))
+                sub1_colors = sub1_config.get('颜色', {})
+                self._update_color_widget('video_sub1_color_text', sub1_colors.get('文字颜色', '#FFD700'))
+                self._update_color_widget('video_sub1_color_stroke', sub1_colors.get('描边颜色', 'black'))
+                self._update_color_widget('video_sub1_color_bg', sub1_colors.get('背景颜色', 'rgba(200,50,50,1)'))
+
+            if len(sub_configs) > 1:
+                sub2_config = sub_configs[1]
+                self.video_sub2_offset_y_entry.delete(0, 'end');
+                self.video_sub2_offset_y_entry.insert(0, sub2_config.get('相对Y轴偏移', '30'))
+                sub2_colors = sub2_config.get('颜色', {})
+                self._update_color_widget('video_sub2_color_text', sub2_colors.get('文字颜色', 'white'))
+                self._update_color_widget('video_sub2_color_stroke', sub2_colors.get('描边颜色', 'black'))
+                self._update_color_widget('video_sub2_color_bg', sub2_colors.get('背景颜色', 'rgba(50,50,50,1)'))
+
+            self.log_video(f"ℹ️ 已加载预设 '{preset_name}'。")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            self.log_video(f"❌ 加载预设失败: {e}")
     def setup_image_settings_tab(self, tab):
         scrollable_frame = ctk.CTkScrollableFrame(tab, label_text="图片处理的所有参数均在此配置")
         scrollable_frame.pack(expand=True, fill="both", padx=5, pady=5)
@@ -7802,46 +8176,9 @@ class App(ctk.CTk):
             self.log_image(f"图片配置错误: {e}")
             return None
 
-    def generate_video_preview(self):
-        self.preview_button.configure(state="disabled", text="正在生成...")
-        self.update_idletasks()
-        try:
-            config = self.get_video_config_from_gui()
-            if not config: self.preview_label.configure(image=None, text="配置无效，无法生成预览"); self.preview_display_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5); return
-            preview_pil_image = Image.new('RGB', (1280, 720), (40, 40, 40))
-            sample_text = "短文案&这是一个非常长的句子用于演示自动换行功能/这是手动换行&第三块/也支持手动换行"
-            text_parts = [part.strip() for part in sample_text.split('&')]
-            shared_style_config = config['shared_style']
-            main_text_config = config['main_text']
-            main_overlay_img = self._create_overlay_as_pillow_image(text_parts[0], shared_style_config, main_text_config, (1280, 720))
-            pos_config = main_text_config['position']
-            x_pos_val, y_pos = pos_config.get('x', 'center'), pos_config.get('y', 'center')
-            paste_x = (preview_pil_image.width - main_overlay_img.width) // 2 if x_pos_val == 'center' else int(x_pos_val)
-            paste_y = int(y_pos)
-            preview_pil_image.paste(main_overlay_img, (paste_x, paste_y), main_overlay_img)
-            last_clip_y, last_clip_height = paste_y, main_overlay_img.height
-            sub_texts_configs = config.get('sub_texts', [])
-            for k, sub_text in enumerate(text_parts[1:]):
-                if k >= len(sub_texts_configs): break
-                sub_text_config = sub_texts_configs[k]
-                sub_overlay_img = self._create_overlay_as_pillow_image(sub_text, shared_style_config, sub_text_config, (1280, 720))
-                y_offset = sub_text_config.get("relative_y_offset", 10)
-                new_y = last_clip_y + last_clip_height + y_offset
-                new_x = (preview_pil_image.width - sub_overlay_img.width) // 2
-                preview_pil_image.paste(sub_overlay_img, (new_x, new_y), sub_overlay_img)
-                last_clip_y, last_clip_height = new_y, sub_overlay_img.height
-            PREVIEW_DISPLAY_SIZE = (720, 405)
-            ctk_image = ctk.CTkImage(light_image=preview_pil_image, dark_image=preview_pil_image, size=PREVIEW_DISPLAY_SIZE)
-            self.preview_label.configure(image=ctk_image, text="")
-            self.preview_display_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
-        except Exception as e:
-            self.preview_label.configure(image=None, text=f"预览生成失败:\n{e}")
-            self.preview_display_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
-        finally:
-            self.preview_button.configure(state="normal", text="生成视频字幕预览")
 
-    def close_video_preview(self):
-        self.preview_display_frame.grid_forget()
+
+
 
     def _create_overlay_as_pillow_image(self, text, shared_style, specific_config, video_size):
         """
