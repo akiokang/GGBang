@@ -717,79 +717,8 @@ class App(ctk.CTk):
     # ==================== 从这里开始粘贴最终正确版代码 (替换整个 _itv_worker_ffmpeg 函数) ====================
     def _itv_worker_ffmpeg(self, image_path, output_path, duration, use_gpu, zoom_amplitude, zoom_speed):
         """
-        【最终正确版】修正了 zoompan 滤镜与 setsar 滤镜链的语法错误。
-        """
-        try:
-            ffmpeg_path = self._find_executable("ffmpeg")
-            if not ffmpeg_path:
-                self.log_itv(f"  -> ❌ 错误: 找不到 ffmpeg.exe");
-                return False
-
-            W, H = 1080, 1920
-            fps = 30
-
-            # 1. 构建 zoompan 滤镜的核心：z（zoom）表达式。
-            #    为了避免复杂的引号问题，我们将表达式直接构建。
-            zoom_expr = f"1+{zoom_amplitude}*sin({zoom_speed}*t*PI/{duration})"
-
-            # 2. 构建语法完全正确的滤镜字符串。
-            #    - zoompan滤镜的所有选项 (z, x, y, d, s, fps) 在一起。
-            #    - 使用逗号 ',' 来分隔 zoompan 滤镜和 setsar 滤镜。
-            filter_complex = (
-                f"zoompan="
-                f"z='{zoom_expr}':"
-                f"x='iw/2-(iw/zoom/2)':"
-                f"y='ih/2-(ih/zoom/2)':"
-                f"d=1:"
-                f"s={W}x{H}:"
-                f"fps={fps},"  # <--- 关键修正：逗号在此处，用于分隔滤镜
-                f"setsar=1"  # <--- 关键修正：setsar=1 作为一个独立的滤镜
-            )
-
-            # 3. 构建最终的 FFmpeg 命令
-            command = [
-                ffmpeg_path, '-y',
-                '-loop', '1',
-                '-i', os.path.normpath(image_path),
-                '-vf', filter_complex,
-                '-t', str(duration),
-                '-an',
-            ]
-
-            if use_gpu and self.is_gpu_available:
-                self.log_itv("    -> 使用FFmpeg zoompan滤镜+GPU编码...")
-                command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23', '-pix_fmt', 'yuv420p'])
-            else:
-                self.log_itv("    -> 使用FFmpeg zoompan滤镜+CPU编码...")
-                command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p'])
-
-            command.append(os.path.normpath(output_path))
-
-            creation_flags = 0
-            if sys.platform == 'win32':
-                creation_flags = subprocess.CREATE_NO_WINDOW
-
-            # 4. 执行命令
-            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
-                           creationflags=creation_flags)
-            return True
-
-        except subprocess.CalledProcessError as e:
-            # 提取 FFmpeg 的核心错误信息并显示
-            error_lines = e.stderr.strip().split('\n')
-            # FFmpeg 的核心错误通常在最后几行
-            core_error = "\n".join(error_lines[-5:]) if error_lines else "未知FFmpeg错误"
-            self.log_itv(f"  -> ❌ 错误: FFmpeg处理失败:\n{core_error}")
-            return False
-        except Exception as e:
-            self.log_itv(f"  -> ❌ Python执行错误: {e}")
-            return False
-
-    # ==================== 第1步：请用下面的代码块完整替换 _itv_worker_ffmpeg 函数 ====================
-    def _itv_worker_ffmpeg(self, image_path, output_path, duration, use_gpu, zoom_amplitude, zoom_speed):
-        """
-        【最终回归版】回归到最稳定可靠的 OpenCV 逐帧处理 + FFmpeg 管道编码方案。
-        此方案绕开了所有FFmpeg动态滤镜的Bug。
+        【GPU兼容性最终修正版】在GPU模式下，强制添加-vf format=yuv420p滤镜，
+        确保传递给NVIDIA编码器的数据格式是其兼容的yuv420p，解决[Errno 22]问题。
         """
         proc = None
         try:
@@ -802,22 +731,31 @@ class App(ctk.CTk):
             fps = 30
             total_frames = int(duration * fps)
 
+            # 管道输入参数，明确指定来自Python的数据是 bgr24 格式
             command = [
                 ffmpeg_path, '-y',
                 '-f', 'rawvideo',
                 '-vcodec', 'rawvideo',
                 '-s', f'{W}x{H}',
-                '-pix_fmt', 'bgr24',  # OpenCV输出的格式是BGR
+                '-pix_fmt', 'bgr24',
                 '-r', str(fps),
                 '-i', '-',
                 '-an',
             ]
 
             if use_gpu and self.is_gpu_available:
-                self.log_itv("    -> [稳定模式] 使用OpenCV+GPU管道...")
-                command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23', '-pix_fmt', 'yuv420p'])
+                self.log_itv("    -> [高速模式] 使用OpenCV+GPU管道...")
+                # --- 核心修正：在编码器之前，插入 -vf format=yuv420p 滤镜 ---
+                command.extend([
+                    '-vf', 'format=yuv420p',  # 强制将bgr24转换为yuv420p
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'fast',
+                    '-cq', '23'
+                    # 注意：因为格式已由-vf指定，所以这里不再需要-pix_fmt参数
+                ])
             else:
-                self.log_itv("    -> [稳定模式] 使用OpenCV+CPU管道...")
+                self.log_itv("    -> [高速模式] 使用OpenCV+CPU管道...")
+                # CPU模式保持不变，因为它本身就兼容bgr24
                 command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p'])
 
             command.append(os.path.normpath(output_path))
@@ -833,37 +771,29 @@ class App(ctk.CTk):
                 raise IOError(f"OpenCV无法读取图片: {image_path}")
 
             orig_h, orig_w, _ = img_original.shape
-            scale_factor = max(W / orig_w, H / orig_h)
+            base_scale_factor = max(W / orig_w, H / orig_h)
 
             for i in range(total_frames):
                 t = i / fps
-                dynamic_factor = 1 + zoom_amplitude * math.sin(zoom_speed * t * math.pi / duration)
-                safe_dynamic_factor = max(0.01, dynamic_factor)
-                current_zoom = scale_factor * safe_dynamic_factor
+                normalized_effect = math.sin((t * math.pi) / duration)
+                dynamic_factor = 1 + zoom_amplitude * normalized_effect
+                current_zoom = base_scale_factor * dynamic_factor
                 new_w, new_h = int(orig_w * current_zoom), int(orig_h * current_zoom)
 
-                if new_w == 0 or new_h == 0: continue
+                if new_w <= 0 or new_h <= 0: continue
 
                 resized_img = cv2.resize(img_original, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-
                 top, left = (new_h - H) // 2, (new_w - W) // 2
+                top, left = max(0, top), max(0, left)
+                bottom, right = min(new_h, top + H), min(new_w, left + W)
+                final_frame = resized_img[top:bottom, left:right]
 
-                # 增加安全边界检查，确保裁剪区域不超出图像范围
-                top = max(0, top)
-                left = max(0, left)
-                bottom = min(new_h, top + H)
-                right = min(new_w, left + W)
-
-                cropped_frame = resized_img[top:bottom, left:right]
-
-                # 如果裁剪后的尺寸不完全匹配，创建一个黑色背景并粘贴上去
-                if cropped_frame.shape[0] != H or cropped_frame.shape[1] != W:
-                    final_frame = np.zeros((H, W, 3), dtype=np.uint8)
-                    paste_h, paste_w, _ = cropped_frame.shape
+                if final_frame.shape[0] != H or final_frame.shape[1] != W:
+                    canvas = np.zeros((H, W, 3), dtype=np.uint8)
+                    paste_h, paste_w, _ = final_frame.shape
                     paste_y, paste_x = (H - paste_h) // 2, (W - paste_w) // 2
-                    final_frame[paste_y:paste_y + paste_h, paste_x:paste_x + paste_w] = cropped_frame
-                else:
-                    final_frame = cropped_frame
+                    canvas[paste_y:paste_y + paste_h, paste_x:paste_x + paste_w] = final_frame
+                    final_frame = canvas
 
                 proc.stdin.write(final_frame.tobytes())
 
@@ -874,7 +804,6 @@ class App(ctk.CTk):
             if proc.returncode != 0:
                 raise subprocess.CalledProcessError(proc.returncode, command,
                                                     stderr=stderr_data.decode('utf-8', 'ignore'))
-
             return True
 
         except (subprocess.CalledProcessError, Exception) as e:
@@ -886,13 +815,7 @@ class App(ctk.CTk):
                 proc.kill()
             return False
 
-    # ==================== 第1步：替换到此结束 ====================
 
-    # ==================== 到这里结束粘贴 ====================
-
-    # ==================== 到这里结束粘贴 ====================
-
-    # ==================== 到这里结束粘贴 ====================
     def run_img_to_video_logic(self):
         try:
             image_root_folder = self.itv_image_folder_entry.get()
