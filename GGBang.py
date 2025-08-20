@@ -404,6 +404,7 @@ class App(ctk.CTk):
         self.avatar_stop_event = threading.Event()
         self.porter_stop_event = threading.Event()
         self.img_to_video_stop_event = threading.Event()
+        self.split_screen_stop_event = threading.Event()
         self.ITV_PRESETS_FILE = get_persistent_settings_path("img_to_video_presets.json")
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
         self.VIDEO_PRESETS_FILE = get_persistent_settings_path("video_presets.json")
@@ -480,8 +481,258 @@ class App(ctk.CTk):
         # 4. 调用各个子功能的设置函数，并把对应的子标签页传递给它们
 
         self.setup_avatar_workflow(ai_sub_tabview.tab("AI女巫"))
+        ai_sub_tabview.add("视频分屏")  # <--
         self.setup_audio_extraction_workflow(ai_sub_tabview.tab("音频提取"))
         self.setup_video_clone_workflow(ai_sub_tabview.tab("视频克隆"))
+        self.setup_split_screen_workflow(ai_sub_tabview.tab("视频分屏"))
+
+    def setup_split_screen_workflow(self, parent_tab):
+        """创建视频分屏合成功能的UI界面，并适配GGBang的UI风格"""
+        tab = parent_tab
+
+        # 路径设置
+        self.create_folder_selection_row(tab, "视频文件夹:", "选择包含视频的文件夹", "ss_videos_folder_entry")
+        self.create_folder_selection_row(tab, "图片文件夹:", "选择包含图片的文件夹", "ss_images_folder_entry")
+        self.create_folder_selection_row(tab, "输出文件夹:", "选择处理结果的存放位置", "ss_output_folder_entry")
+
+        # 设置区域
+        settings_frame = ctk.CTkFrame(tab)
+        settings_frame.pack(fill="x", padx=10, pady=10)
+        settings_frame.grid_columnconfigure(1, weight=1)
+
+        # GPU 加速选项
+        ctk.CTkLabel(settings_frame, text="编码器/加速:", width=120, anchor="w").grid(row=0, column=0, padx=(10, 10),
+                                                                                      pady=5)
+        self.ss_gpu_options_map = {
+            "默认CPU (libx264)": "libx264",
+            "NVIDIA (h264_nvenc)": "h264_nvenc",
+            "AMD (h264_amf)": "h264_amf",
+            "Intel (h264_qsv)": "h264_qsv"
+        }
+        self.ss_gpu_selection = ctk.StringVar(value="NVIDIA (h264_nvenc)")
+        gpu_menu = ctk.CTkOptionMenu(settings_frame, variable=self.ss_gpu_selection,
+                                     values=list(self.ss_gpu_options_map.keys()))
+        gpu_menu.grid(row=0, column=1, sticky="ew", padx=10, pady=5)
+        setattr(self, "ss_gpu_menu", gpu_menu)  # 方便后续可能的调用
+
+        # 视频显示区域比例输入框 (使用GGBang的UI辅助函数创建)
+        ratio_row = self.create_widget_row(settings_frame, "视频显示区域(%):", "ss_video_ratio", "50",
+                                           placeholder="例如: 60 (视频占顶部60%)")
+        ratio_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=0, pady=0)  # 使其在settings_frame中正确布局
+
+        # 控制按钮
+        button_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        button_frame.pack(fill="x", padx=10, pady=10)
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.ss_start_button = ctk.CTkButton(button_frame, text="开始处理", height=40,
+                                             command=self.start_split_screen_processing)
+        self.ss_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.ss_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
+                                            command=self.stop_split_screen_processing, state="disabled", fg_color="red",
+                                            hover_color="darkred")
+        self.ss_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        # 日志区域
+        self.ss_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9")
+        self.ss_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
+
+    def log_split_screen(self, message, clear=False):
+        """为新功能创建专用的日志记录器"""
+        self.after(0, self._update_log, self.ss_log_textbox, message, clear)
+
+    def start_split_screen_processing(self):
+        self.split_screen_stop_event.clear()
+        self.ss_start_button.configure(state="disabled")
+        self.ss_stop_button.configure(state="normal")
+        self.log_split_screen("处理开始...", clear=True)
+        threading.Thread(target=self.run_split_screen_logic, daemon=True).start()
+
+    def stop_split_screen_processing(self):
+        self.log_split_screen("🔴 发送停止信号...请等待当前文件处理完毕。")
+        self.split_screen_stop_event.set()
+        self.ss_stop_button.configure(state="disabled")
+
+    def _reset_split_screen_buttons(self):
+        self.ss_start_button.configure(state="normal")
+        self.ss_stop_button.configure(state="disabled")
+
+    def run_split_screen_logic(self):
+        """从2.py迁移并适配的主处理逻辑"""
+        try:
+            videos_folder = self.ss_videos_folder_entry.get()
+            images_folder = self.ss_images_folder_entry.get()
+            output_folder = self.ss_output_folder_entry.get()
+            selected_gpu_key = self.ss_gpu_selection.get()
+            gpu_codec = self.ss_gpu_options_map.get(selected_gpu_key, "libx264")
+
+            video_ratio_percent = self._safe_float_convert(self.ss_video_ratio_entry.get(), 50.0)
+            if not (1 <= video_ratio_percent <= 99):
+                self.log_split_screen(f"⚠️ 警告: 视频显示区域百分比 '{video_ratio_percent}%' 无效，已重置为默认值 50%。")
+                video_ratio_percent = 50.0
+            video_ratio = video_ratio_percent / 100.0
+
+            self.log_split_screen(f"INFO: 使用的视频编码器: {gpu_codec}")
+            self.log_split_screen(
+                f"INFO: 视频/图片分割比例: {video_ratio_percent:.0f}% / {100 - video_ratio_percent:.0f}%")
+            if gpu_codec != "libx264": self.log_split_screen(
+                "INFO: 请确保您的 FFmpeg 版本支持所选的GPU编码器并且驱动已正确安装。")
+
+            if not all([videos_folder, images_folder, output_folder]):
+                self.log_split_screen("❌ 错误: 所有文件夹路径都必须填写。");
+                self.after(0, self._reset_split_screen_buttons);
+                return
+
+            ffmpeg_path = self._find_executable("ffmpeg")
+            if not ffmpeg_path:
+                self.log_split_screen("❌ 错误: 找不到 ffmpeg。请确保 FFmpeg 已安装并添加到系统PATH。");
+                self.after(0, self._reset_split_screen_buttons);
+                return
+
+            os.makedirs(output_folder, exist_ok=True)
+            temp_folder = os.path.join(output_folder, "temp_resized_videos")
+            if os.path.exists(temp_folder): shutil.rmtree(temp_folder)
+            os.makedirs(temp_folder, exist_ok=True)
+
+            VALID_VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.flv')
+            VALID_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+            video_files = sorted([f for f in os.listdir(videos_folder) if f.lower().endswith(VALID_VIDEO_EXTENSIONS)])
+            image_files = sorted([f for f in os.listdir(images_folder) if f.lower().endswith(VALID_IMAGE_EXTENSIONS)])
+
+            if not video_files: self.log_split_screen("⚠️ 警告：在视频文件夹中没有找到支持的视频文件。"); self.after(0,
+                                                                                                                   self._reset_split_screen_buttons); return
+            if not image_files: self.log_split_screen("⚠️ 警告：在图片文件夹中没有找到支持的图片文件。"); self.after(0,
+                                                                                                                   self._reset_split_screen_buttons); return
+
+            num_videos = len(video_files)
+            num_images = len(image_files)
+            total_jobs = min(num_videos, num_images)
+
+            self.log_split_screen(
+                f"找到 {num_videos} 个视频和 {num_images} 个图片。将按顺序进行 1 对 1 合并，总共将生成 {total_jobs} 个视频。")
+            if total_jobs == 0:
+                self.log_split_screen("⚠️ 警告：视频或图片文件夹中没有足够的文件进行配对处理。");
+                self.after(0, self._reset_split_screen_buttons);
+                return
+
+            output_counter = 0
+            for i in range(total_jobs):
+                if self.split_screen_stop_event.is_set():
+                    break
+
+                video_name = video_files[i]
+                image_name = image_files[i]
+                job_counter = i + 1
+
+                self.log_split_screen(f"\n[ {job_counter} / {total_jobs} ] 正在处理: {video_name} + {image_name}")
+
+                video_path = os.path.join(videos_folder, video_name)
+                processed_video_path = self._ss_preprocess_video(ffmpeg_path, video_path, temp_folder, gpu_codec)
+                if not processed_video_path:
+                    self.log_split_screen(f"跳过视频: {video_name}")
+                    continue
+
+                image_path = os.path.join(images_folder, image_name)
+                output_filename = f"{output_counter}.mp4"
+                output_path = os.path.join(output_folder, output_filename)
+
+                success, error_msg = self._ss_worker(ffmpeg_path, processed_video_path, image_path, output_path,
+                                                     gpu_codec, video_ratio)
+
+                if success:
+                    self.log_split_screen(f"   -> ✅ 成功! 已保存到: {output_filename}")
+                    output_counter += 1
+                else:
+                    self.log_split_screen(f"   -> ❌ 处理失败! FFmpeg 错误:\n{error_msg}")
+
+            if self.split_screen_stop_event.is_set():
+                self.log_split_screen("\n🔴 任务被用户中止。")
+            else:
+                self.log_split_screen(f"\n🎉 批量处理完成！总共成功生成了 {output_counter} 个视频。")
+
+            try:
+                shutil.rmtree(temp_folder)
+                self.log_split_screen("✅ 临时文件已清理。")
+            except OSError as e:
+                self.log_split_screen(f"⚠️ 警告：无法删除临时文件夹: {e}")
+        except Exception as e:
+            self.log_split_screen(f"发生未预料的严重错误: {e}")
+            self.log_split_screen(traceback.format_exc())
+        finally:
+            self.after(0, self._reset_split_screen_buttons)
+
+    def _ss_preprocess_video(self, ffmpeg_path, input_path, temp_folder, gpu_codec):
+        """从2.py迁移的视频预处理函数"""
+        self.log_split_screen(f"  -> [预处理] 正在统一分辨率为 1080x1920...")
+        base_name = os.path.basename(input_path)
+        temp_output_path = os.path.join(temp_folder, f"resized_{base_name}")
+        filter_complex = (
+            f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1[bg];"
+            f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
+            f"[bg]boxblur=50:1[blurred_bg];"
+            f"[blurred_bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+        )
+        command = [
+            ffmpeg_path, "-y", "-i", input_path, "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-c:v", gpu_codec
+        ]
+        if gpu_codec == "libx264":
+            command.extend(["-preset", "fast"])
+        elif "nvenc" in gpu_codec:
+            command.extend(["-preset", "p6", "-tune", "hq"])
+        command.append(temp_output_path)
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+                           creationflags=creation_flags)
+            self.log_split_screen("  -> ✅ 分辨率统一成功。")
+            return temp_output_path
+        except subprocess.CalledProcessError as e:
+            self.log_split_screen(f"  -> ❌ 预处理失败: {e.stderr}")
+            return None
+        except Exception as e:
+            self.log_split_screen(f"  -> ❌ 预处理时发生未知错误: {e}")
+            return None
+
+    def _ss_worker(self, ffmpeg_path: str, video_path: str, image_path: str, output_path: str, gpu_codec: str,
+                   video_ratio: float) -> (bool, str):
+        """从2.py迁移的核心分屏合成函数"""
+        video_width, video_height = 1080, 1920
+        top_height = int(video_height * video_ratio)
+        top_height = (top_height // 2) * 2
+        bottom_height = video_height - top_height
+
+        filter_complex = (
+            f"[0:v]crop=iw:{top_height}:0:0[top];"
+            f"[1:v]scale={video_width}:-2,"
+            f"crop=iw:{bottom_height}:0:ih-{bottom_height}[bottom];"
+            f"[top][bottom]vstack[final_v]"
+        )
+        command = [
+            ffmpeg_path, "-y",
+            "-i", video_path,
+            "-i", image_path,
+            "-filter_complex", filter_complex,
+            "-map", "[final_v]",
+            "-map", "0:a?",
+            "-c:v", gpu_codec,
+            "-c:a", "aac", "-b:a", "192k",
+            output_path
+        ]
+        if "nvenc" in gpu_codec:
+            command.extend(["-preset", "p6", "-tune", "hq"])
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+                           creationflags=creation_flags)
+            return True, ""
+        except subprocess.CalledProcessError as e:
+            return False, e.stderr
+        except Exception as e:
+            return False, str(e)
     # ==============================================================================
     # --- 视频总菜单 (新) ---
     # ==============================================================================
