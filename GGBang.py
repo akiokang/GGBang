@@ -8855,12 +8855,9 @@ class App(ctk.CTk):
                 'bg_folder': self.gs_image_bg_folder_entry.get(),
                 'output_folder': self.gs_image_output_folder_entry.get(),
                 'num_groups': self.gs_image_num_groups_entry.get(),
-                'is_ai_mode': self.gs_image_mode_switch.get(),
-                'alpha_matting': self.gs_image_alpha_matting_switch.get(),
-                'fg_threshold': self.gs_image_fg_slider.get(),
-                'bg_threshold': self.gs_image_bg_slider.get(),
+
                 'threshold': self.gs_image_threshold_slider.get(),
-                'use_gpu': self.gs_image_gpu_switch.get()
+
             },
 
             'ab_image_settings': {
@@ -9103,12 +9100,10 @@ class App(ctk.CTk):
         _load_entry('gs_image_bg_folder_entry', gs_img_s, 'bg_folder')
         _load_entry('gs_image_output_folder_entry', gs_img_s, 'output_folder')
         _load_entry('gs_image_num_groups_entry', gs_img_s, 'num_groups', '10-6')
-        _load_switch('gs_image_mode_switch', gs_img_s, 'is_ai_mode', True)
-        _load_switch('gs_image_alpha_matting_switch', gs_img_s, 'alpha_matting', True)
-        _load_slider('gs_image_fg_slider', gs_img_s, 'fg_threshold', 240)
-        _load_slider('gs_image_bg_slider', gs_img_s, 'bg_threshold', 10)
+
+
         _load_slider('gs_image_threshold_slider', gs_img_s, 'threshold', 170)
-        _load_switch('gs_image_gpu_switch', gs_img_s, 'use_gpu')
+
         if hasattr(self, 'gs_image_mode_switch'): self._toggle_gs_image_mode_widgets()  # 更新UI状态
 
         ab_s = settings.get('ab_image_settings', {})
