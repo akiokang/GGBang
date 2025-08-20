@@ -29,6 +29,7 @@ from moviepy.video.fx import all as vfx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor, ImageFilter # <--- 确保 ImageFilter 在这里
 import moviepy.config as cf
 from pathlib import Path
+
 # --- iOS批量传输 全局配置 ---
 MCAST_GRP = '224.0.0.167'
 MCAST_PORT = 53317
@@ -63,6 +64,11 @@ try:
 
 except ImportError:
     tk_messagebox.showerror("依赖缺失", "AI抠像功能所需的核心库 (opencv-python, mediapipe) 未安装。\n请运行: pip install opencv-python mediapipe")
+try:
+    import rembg
+except ImportError:
+    tk_messagebox.showerror("依赖缺失", "AI抠图功能所需的核心库 (rembg) 未安装。\n请运行: pip install rembg[gpu]")
+
 # ==============================================================================
 # 全局辅助函数
 # ==============================================================================
@@ -377,6 +383,8 @@ class App(ctk.CTk):
 
         # 3. 为所有功能创建停止事件
         self.distribution_stop_event = threading.Event()
+        self.gs_image_stop_event = threading.Event()  # 为绿幕图片模式添加停止事件
+        self.ITV_PRESETS_FILE = get_persistent_settings_path("img_to_video_presets.json")
         self.video_stop_event = threading.Event()
         self.image_stop_event = threading.Event()
         self.ab_image_stop_event = threading.Event()
@@ -706,13 +714,85 @@ class App(ctk.CTk):
         self.log_itv("", clear=True)
         threading.Thread(target=self.run_img_to_video_logic, daemon=True).start()
 
+    # ==================== 从这里开始粘贴最终正确版代码 (替换整个 _itv_worker_ffmpeg 函数) ====================
     def _itv_worker_ffmpeg(self, image_path, output_path, duration, use_gpu, zoom_amplitude, zoom_speed):
         """
-        【全FFmpeg高性能版 - v15 - 最终修正版】修正变量名拼写错误。
+        【最终正确版】修正了 zoompan 滤镜与 setsar 滤镜链的语法错误。
         """
-        proc = None  # 初始化FFmpeg进程变量
         try:
-            # --- 1. 获取FFmpeg路径和通用参数 ---
+            ffmpeg_path = self._find_executable("ffmpeg")
+            if not ffmpeg_path:
+                self.log_itv(f"  -> ❌ 错误: 找不到 ffmpeg.exe");
+                return False
+
+            W, H = 1080, 1920
+            fps = 30
+
+            # 1. 构建 zoompan 滤镜的核心：z（zoom）表达式。
+            #    为了避免复杂的引号问题，我们将表达式直接构建。
+            zoom_expr = f"1+{zoom_amplitude}*sin({zoom_speed}*t*PI/{duration})"
+
+            # 2. 构建语法完全正确的滤镜字符串。
+            #    - zoompan滤镜的所有选项 (z, x, y, d, s, fps) 在一起。
+            #    - 使用逗号 ',' 来分隔 zoompan 滤镜和 setsar 滤镜。
+            filter_complex = (
+                f"zoompan="
+                f"z='{zoom_expr}':"
+                f"x='iw/2-(iw/zoom/2)':"
+                f"y='ih/2-(ih/zoom/2)':"
+                f"d=1:"
+                f"s={W}x{H}:"
+                f"fps={fps},"  # <--- 关键修正：逗号在此处，用于分隔滤镜
+                f"setsar=1"  # <--- 关键修正：setsar=1 作为一个独立的滤镜
+            )
+
+            # 3. 构建最终的 FFmpeg 命令
+            command = [
+                ffmpeg_path, '-y',
+                '-loop', '1',
+                '-i', os.path.normpath(image_path),
+                '-vf', filter_complex,
+                '-t', str(duration),
+                '-an',
+            ]
+
+            if use_gpu and self.is_gpu_available:
+                self.log_itv("    -> 使用FFmpeg zoompan滤镜+GPU编码...")
+                command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23', '-pix_fmt', 'yuv420p'])
+            else:
+                self.log_itv("    -> 使用FFmpeg zoompan滤镜+CPU编码...")
+                command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p'])
+
+            command.append(os.path.normpath(output_path))
+
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+
+            # 4. 执行命令
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+                           creationflags=creation_flags)
+            return True
+
+        except subprocess.CalledProcessError as e:
+            # 提取 FFmpeg 的核心错误信息并显示
+            error_lines = e.stderr.strip().split('\n')
+            # FFmpeg 的核心错误通常在最后几行
+            core_error = "\n".join(error_lines[-5:]) if error_lines else "未知FFmpeg错误"
+            self.log_itv(f"  -> ❌ 错误: FFmpeg处理失败:\n{core_error}")
+            return False
+        except Exception as e:
+            self.log_itv(f"  -> ❌ Python执行错误: {e}")
+            return False
+
+    # ==================== 第1步：请用下面的代码块完整替换 _itv_worker_ffmpeg 函数 ====================
+    def _itv_worker_ffmpeg(self, image_path, output_path, duration, use_gpu, zoom_amplitude, zoom_speed):
+        """
+        【最终回归版】回归到最稳定可靠的 OpenCV 逐帧处理 + FFmpeg 管道编码方案。
+        此方案绕开了所有FFmpeg动态滤镜的Bug。
+        """
+        proc = None
+        try:
             ffmpeg_path = self._find_executable("ffmpeg")
             if not ffmpeg_path:
                 self.log_itv(f"  -> ❌ 错误: 找不到 ffmpeg.exe");
@@ -722,35 +802,32 @@ class App(ctk.CTk):
             fps = 30
             total_frames = int(duration * fps)
 
-            # --- 2. 准备FFmpeg命令，配置为从管道接收数据 ---
             command = [
                 ffmpeg_path, '-y',
                 '-f', 'rawvideo',
                 '-vcodec', 'rawvideo',
                 '-s', f'{W}x{H}',
-                '-pix_fmt', 'bgr24',
+                '-pix_fmt', 'bgr24',  # OpenCV输出的格式是BGR
                 '-r', str(fps),
                 '-i', '-',
                 '-an',
             ]
 
             if use_gpu and self.is_gpu_available:
-                self.log_itv("    -> 使用OpenCV+GPU管道...")
+                self.log_itv("    -> [稳定模式] 使用OpenCV+GPU管道...")
                 command.extend(['-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23', '-pix_fmt', 'yuv420p'])
             else:
-                self.log_itv("    -> 使用OpenCV+CPU管道...")
+                self.log_itv("    -> [稳定模式] 使用OpenCV+CPU管道...")
                 command.extend(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p'])
 
             command.append(os.path.normpath(output_path))
 
-            # --- 3. 启动FFmpeg子进程，并打开stdin管道 ---
             creation_flags = 0
-            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, creationflags=creation_flags,
                                     stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
 
-            # --- 4. 使用OpenCV进行逐帧计算和处理 ---
-            self.log_itv("    -> OpenCV正在逐帧计算并传送数据...")
             img_original = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img_original is None:
                 raise IOError(f"OpenCV无法读取图片: {image_path}")
@@ -760,31 +837,36 @@ class App(ctk.CTk):
 
             for i in range(total_frames):
                 t = i / fps
-
-                # **核心修复：将错误的变量名 `speed` 修正为正确的 `zoom_speed`**
                 dynamic_factor = 1 + zoom_amplitude * math.sin(zoom_speed * t * math.pi / duration)
-
-                # 安全保护，确保缩放因子永远为正数
                 safe_dynamic_factor = max(0.01, dynamic_factor)
-
-                # 使用安全的缩放因子进行最终计算
                 current_zoom = scale_factor * safe_dynamic_factor
-
                 new_w, new_h = int(orig_w * current_zoom), int(orig_h * current_zoom)
 
                 if new_w == 0 or new_h == 0: continue
 
                 resized_img = cv2.resize(img_original, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
-                top = (new_h - H) // 2
-                left = (new_w - W) // 2
-                final_frame = resized_img[top:top + H, left:left + W]
+                top, left = (new_h - H) // 2, (new_w - W) // 2
+
+                # 增加安全边界检查，确保裁剪区域不超出图像范围
+                top = max(0, top)
+                left = max(0, left)
+                bottom = min(new_h, top + H)
+                right = min(new_w, left + W)
+
+                cropped_frame = resized_img[top:bottom, left:right]
+
+                # 如果裁剪后的尺寸不完全匹配，创建一个黑色背景并粘贴上去
+                if cropped_frame.shape[0] != H or cropped_frame.shape[1] != W:
+                    final_frame = np.zeros((H, W, 3), dtype=np.uint8)
+                    paste_h, paste_w, _ = cropped_frame.shape
+                    paste_y, paste_x = (H - paste_h) // 2, (W - paste_w) // 2
+                    final_frame[paste_y:paste_y + paste_h, paste_x:paste_x + paste_w] = cropped_frame
+                else:
+                    final_frame = cropped_frame
 
                 proc.stdin.write(final_frame.tobytes())
 
-            self.log_itv("    -> 所有帧处理完毕，等待FFmpeg完成编码...")
-
-            # --- 5. 关闭管道并等待FFmpeg完成 ---
             proc.stdin.close()
             stderr_data = proc.stderr.read()
             proc.wait()
@@ -794,6 +876,7 @@ class App(ctk.CTk):
                                                     stderr=stderr_data.decode('utf-8', 'ignore'))
 
             return True
+
         except (subprocess.CalledProcessError, Exception) as e:
             error_message = f"  -> ❌ 错误: {e}"
             if hasattr(e, 'stderr') and e.stderr:
@@ -803,6 +886,13 @@ class App(ctk.CTk):
                 proc.kill()
             return False
 
+    # ==================== 第1步：替换到此结束 ====================
+
+    # ==================== 到这里结束粘贴 ====================
+
+    # ==================== 到这里结束粘贴 ====================
+
+    # ==================== 到这里结束粘贴 ====================
     def run_img_to_video_logic(self):
         try:
             image_root_folder = self.itv_image_folder_entry.get()
@@ -937,25 +1027,47 @@ class App(ctk.CTk):
                 if not temp_clip_paths: self.log_itv("  -> 警告: 没有可供拼接的视频片段，跳过此任务。"); shutil.rmtree(
                     temp_dir); continue
 
-                self.log_itv("\n--- 所有片段处理完毕，开始高速拼接最终视频... ---")
-                concat_list_path = os.path.join(temp_dir, "concat_list.txt")
-                with open(concat_list_path, 'w', encoding='utf-8') as f:
-                    for path in temp_clip_paths:
-                        safe_path = os.path.normpath(path).replace('\\', '/')
-                        f.write(f"file '{safe_path}'\n")
+                self.log_itv("\n--- 所有片段处理完毕，切换到高稳定性模式拼接最终视频... ---")
 
                 preset_title = self.itv_preset_menu.get().replace(" ", "_")
                 output_filename = f"{preset_title}_{int(time.time())}_{loop_index}.mp4"
                 final_output_path = os.path.join(final_base_folder, output_filename)
-                concat_command_string = f'"{ffmpeg_path}" -y -f concat -safe 0 -i "{concat_list_path}" -c copy "{final_output_path}"'
+
+                # 动态构建 concat filter 命令
+                inputs_str = " ".join([f'-i "{os.path.normpath(p)}"' for p in temp_clip_paths])
+                filter_streams_str = "".join([f"[{i}:v]" for i in range(len(temp_clip_paths))])
+                num_clips = len(temp_clip_paths)
+
+                # 使用 concat filter, v=1表示视频流, a=0表示无音频流
+                filter_complex_str = f'"{filter_streams_str}concat=n={num_clips}:v=1:a=0[v]"'
+
+                # 确定最终使用的视频编码器
+                final_codec = 'h264_nvenc -preset fast' if use_gpu and self.is_gpu_available else 'libx264 -preset ultrafast'
+
+                # 构建最终的、高度稳定的拼接命令
+                concat_command_string = (
+                    f'"{ffmpeg_path}" -y {inputs_str} '
+                    f'-filter_complex {filter_complex_str} '
+                    f'-map "[v]" -c:v {final_codec} -pix_fmt yuv420p -an "{final_output_path}"'
+                )
+
                 try:
+                    # 在Windows上隐藏命令行窗口
+                    creation_flags = 0
+                    if sys.platform == 'win32':
+                        creation_flags = subprocess.CREATE_NO_WINDOW
+
                     subprocess.run(concat_command_string, shell=True, check=True, capture_output=True, text=True,
-                                   encoding='utf-8', errors='ignore')
+                                   encoding='utf-8', errors='ignore', creationflags=creation_flags)
+
                     log_msg = f"视频生成完毕！" if is_single_mode else f"第 {loop_index} 组视频生成完毕！"
                     self.log_itv(f"✅ {log_msg}已保存至: {final_output_path}")
+
                 except subprocess.CalledProcessError as e_concat:
-                    self.log_itv(f"  -> ❌ 错误: FFmpeg拼接失败: {e_concat.stderr.strip()}")
-                shutil.rmtree(temp_dir)
+                    self.log_itv(f"  -> ❌ 错误: FFmpeg高稳定性拼接失败: {e_concat.stderr.strip()}")
+                finally:
+                    # 确保无论成功与否都清理临时文件夹
+                    shutil.rmtree(temp_dir)
 
             if not self.img_to_video_stop_event.is_set():
                 self.log_itv("\n🎉🎉🎉 所有任务处理完毕！ 🎉🎉🎉")
@@ -3357,9 +3469,21 @@ class App(ctk.CTk):
             self.composite_remix_switch.configure(state="normal")
 
     def setup_greenscreen_composite_workflow(self, parent_tab):
-        """创建“绿幕合成”功能的UI界面 (新增单一模式开关)"""
-        tab = self.main_tabview.tab("绿幕合成")
+        """【重构版】创建“绿幕合成”主标签，并在其中嵌入“视频”和“图片”两个子模式。"""
+        # 1. 在主标签页内部，创建一个新的、用于子菜单的CTkTabview
+        gs_sub_tabview = ctk.CTkTabview(parent_tab)
+        gs_sub_tabview.pack(expand=True, fill="both", padx=5, pady=5)
 
+        # 2. 添加子标签页
+        tab_video = gs_sub_tabview.add("视频模式")
+        tab_image = gs_sub_tabview.add("图片模式")
+
+        # 3. 调用各自的UI设置函数来填充这两个子标签页
+        self._setup_greenscreen_video_tab(tab_video)
+        self._setup_greenscreen_image_tab(tab_image)
+
+    def _setup_greenscreen_video_tab(self, tab):
+        """填充“绿幕合成 - 视频模式”的UI界面 (此为原功能的UI代码)"""
         main_frame = ctk.CTkFrame(tab, fg_color="transparent")
         main_frame.pack(expand=True, fill="both", padx=10, pady=10)
 
@@ -3375,35 +3499,27 @@ class App(ctk.CTk):
         settings_frame.pack(fill="x", pady=(15, 5), ipady=10)
         settings_frame.grid_columnconfigure(1, weight=1)
 
-        # --- 新增: 单一模式开关 ---
         self.composite_single_mode_switch = ctk.CTkSwitch(settings_frame,
                                                           text="单一模式 (一个绿幕视频 vs 多个背景视频)",
                                                           command=self._toggle_composite_mode_widgets)
         self.composite_single_mode_switch.grid(row=0, column=0, columnspan=2, padx=10, pady=(5, 10), sticky="w")
-
-        # --- 原有控件 (行号相应增加) ---
         ctk.CTkLabel(settings_frame, text="生成组数:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
         self.composite_num_groups_entry = ctk.CTkEntry(settings_frame)
         self.composite_num_groups_entry.insert(0, "1")
         self.composite_num_groups_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-
         ctk.CTkLabel(settings_frame, text="手机序号(用.分隔):").grid(row=2, column=0, padx=10, pady=5, sticky="w")
         self.composite_phone_serial_entry = ctk.CTkEntry(settings_frame, placeholder_text="例如: A-1.A-2.B-1")
         self.composite_phone_serial_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
-
         self.composite_num_groups_entry.bind("<KeyRelease>", lambda event: self._update_exclusive_entry_state(
             self.composite_num_groups_entry, self.composite_phone_serial_entry))
         self.composite_phone_serial_entry.bind("<KeyRelease>", lambda event: self._update_exclusive_entry_state(
             self.composite_phone_serial_entry, self.composite_num_groups_entry))
-
         self.composite_remix_switch = ctk.CTkSwitch(settings_frame, text="开启随机拼接模式 (背景由多片段合成)")
         self.composite_remix_switch.grid(row=3, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="w")
-
         calibrate_button = ctk.CTkButton(settings_frame, text="校准颜色 (推荐)", command=self.composite_calibrate_color)
         calibrate_button.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
         self.composite_color_status_label = ctk.CTkLabel(settings_frame, text="颜色: 默认标准绿", text_color="orange")
         self.composite_color_status_label.grid(row=4, column=1, padx=10, pady=5, sticky="w")
-
         ctk.CTkLabel(settings_frame, text="相似度 (0.01-1.0):").grid(row=5, column=0, padx=10, pady=5, sticky="w")
         self.gs_composite_similarity_slider = ctk.CTkSlider(settings_frame, from_=0.01, to=1.0, number_of_steps=99)
         self.gs_composite_similarity_slider.set(0.2)
@@ -3433,7 +3549,6 @@ class App(ctk.CTk):
         self.composite_freeze_duration_entry = ctk.CTkEntry(freeze_entry_frame, width=60)
         self.composite_freeze_duration_entry.insert(0, "3")
         self.composite_freeze_duration_entry.pack(side="left", padx=5)
-
         button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
         button_frame.pack(fill="x", pady=(15, 5))
         button_frame.grid_columnconfigure((0, 1), weight=1)
@@ -3446,10 +3561,184 @@ class App(ctk.CTk):
         self.composite_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
         self.composite_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
         self.composite_log_textbox.pack(expand=True, fill="both", pady=(10, 5))
-
-        # 初始化UI控件状态
         self._toggle_composite_mode_widgets()
 
+    def _setup_greenscreen_image_tab(self, tab):
+        """【最终简化版】UI界面，只保留高速模式和核心参数"""
+        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        # --- 路径设置 ---
+        self.create_folder_selection_row(main_frame, "绿幕图片文件夹:", "选择包含带文字的绿幕图片文件夹",
+                                         "gs_image_source_folder_entry")
+        self.create_folder_selection_row(main_frame, "背景图片文件夹:", "选择作为背景的图片文件夹",
+                                         "gs_image_bg_folder_entry")
+        self.create_folder_selection_row(main_frame, "输出文件夹:", "选择处理结果的存放位置",
+                                         "gs_image_output_folder_entry")
+
+        # --- 核心参数设置 ---
+        settings_frame = ctk.CTkFrame(main_frame)
+        settings_frame.pack(fill="x", pady=(15, 5), ipady=10)
+        settings_frame.grid_columnconfigure(1, weight=1)
+
+        self.create_widget_row(settings_frame, "组数-每组数量:", "gs_image_num_groups", "10-6",
+                               placeholder="例如: 10-6 (10组, 每组6张)").grid(row=0, column=0, columnspan=2, padx=10,
+                                                                              pady=5, sticky="ew")
+
+        # 保留“抠图容差”作为唯一可调参数
+        ctk.CTkLabel(settings_frame, text="抠图容差 (0-255):", font=ctk.CTkFont(weight="bold")).grid(row=1, column=0,
+                                                                                                     padx=10,
+                                                                                                     pady=(15, 0),
+                                                                                                     sticky="w")
+        ctk.CTkLabel(settings_frame, text="数值越大，抠除的绿色范围越广").grid(row=2, column=0, columnspan=2, padx=10,
+                                                                              pady=(0, 5), sticky="w")
+        self.gs_image_threshold_slider = ctk.CTkSlider(settings_frame, from_=0, to=255, number_of_steps=255)
+        self.gs_image_threshold_slider.set(170)
+        self.gs_image_threshold_slider.grid(row=3, column=0, columnspan=2, padx=10, pady=5, sticky="ew")
+
+        # --- 按钮与日志 ---
+        button_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=(15, 5))
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.gs_image_start_button = ctk.CTkButton(button_frame, text="开始批量合成图片", height=40,
+                                                   command=self.start_gs_image_processing)
+        self.gs_image_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.gs_image_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
+                                                  command=lambda: self.gs_image_stop_event.set(), state="disabled",
+                                                  fg_color="red", hover_color="darkred")
+        self.gs_image_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        self.gs_image_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
+        self.gs_image_log_textbox.pack(expand=True, fill="both", pady=(10, 5))
+
+    def log_gs_image(self, message, clear=False):
+        self.after(0, self._update_log, self.gs_image_log_textbox, message, clear)
+
+    def start_gs_image_processing(self):
+        self.gs_image_start_button.configure(state="disabled")
+        self.gs_image_stop_button.configure(state="normal")
+        self.gs_image_stop_event.clear()
+        self.log_gs_image("开始处理...", clear=True)
+        threading.Thread(target=self.run_gs_image_logic, daemon=True).start()
+
+    def _reset_gs_image_buttons(self):
+        self.gs_image_start_button.configure(state="normal")
+        self.gs_image_stop_button.configure(state="disabled")
+
+    def run_gs_image_logic(self):
+        try:
+            # 1. --- 获取所有UI配置 ---
+            source_folder = self.gs_image_source_folder_entry.get()
+            bg_folder = self.gs_image_bg_folder_entry.get()
+            output_folder = self.gs_image_output_folder_entry.get()
+            groups_str = self.gs_image_num_groups_entry.get()
+            threshold = int(self.gs_image_threshold_slider.get())
+
+            # 2. --- 校验与解析 ---
+            if not all([source_folder, bg_folder, output_folder]):
+                self.log_gs_image("❌ 错误: 所有文件夹路径都必须选择！");
+                return
+            try:
+                parts = groups_str.strip().split('-');
+                num_groups = int(parts[0]);
+                files_per_group = int(parts[1])
+                if num_groups <= 0 or files_per_group <= 0: raise ValueError
+            except:
+                self.log_gs_image(f"❌ 错误: '组数-每组数量' 格式不正确。请输入类似 '10-6' 的格式。");
+                return
+
+            img_ext = ('.png', '.jpg', '.jpeg', '.webp')
+            source_images = [os.path.join(source_folder, f) for f in os.listdir(source_folder) if
+                             f.lower().endswith(img_ext) and not f.lower().startswith('.')]
+            background_images = [os.path.join(bg_folder, f) for f in os.listdir(bg_folder) if
+                                 f.lower().endswith(img_ext) and not f.lower().startswith('.') and '$' not in f]
+
+            if not source_images: self.log_gs_image("❌ 错误: 绿幕图片文件夹中没有找到任何图片文件。"); return
+
+            total_needed = num_groups * files_per_group
+            if len(background_images) < total_needed:
+                self.log_gs_image(
+                    f"❌ 错误: 背景图片数量不足！\n   - 需要: {total_needed} 张 ( {num_groups} 组 x 每组 {files_per_group} 张 )\n   - 实际: 只有 {len(background_images)} 张。");
+                return
+            self.log_gs_image("✅ 背景图片数量校验通过。")
+            self.log_gs_image("▶️ 模式: 经典高速模式 (CPU)")
+
+            # 3. --- 主处理循环 ---
+            if os.path.exists(output_folder): shutil.rmtree(output_folder)
+            os.makedirs(output_folder)
+            random.shuffle(background_images);
+            bg_pool = background_images
+            task_count = 0
+            for i in range(num_groups):
+                if self.gs_image_stop_event.is_set(): break
+                group_name = f"group_{i + 1}";
+                group_folder = os.path.join(output_folder, group_name);
+                os.makedirs(group_folder)
+                self.log_gs_image(f"\n--- [开始处理组: {group_name}] ---")
+                selected_gs_images = random.choices(source_images, k=files_per_group)
+                if len(bg_pool) < files_per_group: self.log_gs_image(f"❌ 内部错误: 背景图片池提前耗尽。"); break
+                selected_bg_images = bg_pool[:files_per_group];
+                bg_pool = bg_pool[files_per_group:]
+                for j in range(files_per_group):
+                    if self.gs_image_stop_event.is_set(): break
+                    gs_path = selected_gs_images[j];
+                    bg_path = selected_bg_images[j];
+                    task_count += 1
+                    self.log_gs_image(f"  -> 正在合成: {os.path.basename(gs_path)} + {os.path.basename(bg_path)}")
+                    output_filename = f"{os.path.splitext(os.path.basename(gs_path))[0]}_on_{os.path.splitext(os.path.basename(bg_path))[0]}.jpg"
+                    output_path = os.path.join(group_folder, output_filename)
+
+                    success = self._gs_image_worker(gs_path, bg_path, output_path, threshold)
+
+                    if success:
+                        try:
+                            os.remove(bg_path)
+                            self.log_gs_image(f"    -> ✅ 背景图已使用并删除: {os.path.basename(bg_path)}")
+                        except OSError as e:
+                            self.log_gs_image(f"    -> ⚠️ 警告: 删除背景图失败: {e}")
+            if self.gs_image_stop_event.is_set():
+                self.log_gs_image("🔴 任务已中止。")
+            else:
+                self.log_gs_image(f"\n--- 🎉 所有任务处理完毕！共生成 {task_count} 张图片。 ---")
+
+        except Exception as e:
+            self.log_gs_image(f"发生未预料的严重错误: {e}");
+            traceback.print_exc()
+        finally:
+            self.after(0, self._reset_gs_image_buttons)
+
+    def _gs_image_worker(self, gs_path, bg_path, output_path, threshold):
+        """【高速模式】使用传统的颜色识别（Chroma Key）进行抠图合成"""
+        try:
+            with Image.open(gs_path) as gs_img, Image.open(bg_path) as bg_img:
+                gs_img = gs_img.convert("RGBA")
+                bg_img = bg_img.convert("RGBA")
+
+                if gs_img.size != bg_img.size:
+                    bg_img = bg_img.resize(gs_img.size, Image.Resampling.LANCZOS)
+
+                # --- 经典高速抠图逻辑 ---
+                gs_arr = np.array(gs_img)
+                green_color = np.array([0, 255, 0])  # 目标颜色：纯绿色
+
+                # 计算每个像素与纯绿色的距离
+                distances = np.sqrt(np.sum((gs_arr[:, :, :3].astype("float") - green_color) ** 2, axis=2))
+                mask = distances < threshold  # 如果距离小于阈值，则视为要抠除的部分
+
+                gs_arr[mask, 3] = 0  # 将符合条件的像素透明度设为0
+                foreground_img = Image.fromarray(gs_arr)
+
+                # 统一的合成与保存逻辑
+                bg_img.paste(foreground_img, (0, 0), foreground_img)
+                bg_img.convert("RGB").save(output_path, "JPEG", quality=95)
+                self.log_gs_image(f"    ✅ 合成成功: {os.path.basename(output_path)}")
+                return True
+
+        except Exception as e:
+            self.log_gs_image(f"    ❌ 合成失败: {e}")
+            return False
     def _create_random_remix_background(self, bg_video_pool, target_duration, temp_dir):
         """为混剪模式生成一个随机拼接的背景视频 (修改版：返回用过的原始文件列表)"""
         self.log_composite(f"  -> [混剪] 开始为 {target_duration:.2f}s 的时长随机拼接背景...")
@@ -8375,6 +8664,30 @@ class App(ctk.CTk):
                 'allow_flip': self.image_flip_switch.get(),
                 'no_background': self.image_no_bg_switch.get(),
             },
+            # --- 新增：保存“图转视频”的配置 ---
+            'img_to_video_settings': {
+                'image_folder': self.itv_image_folder_entry.get(),
+                'output_folder': self.itv_output_folder_entry.get(),
+                'single_mode': self.itv_single_mode_switch.get(),
+                'num_groups': self.itv_num_groups_entry.get(),
+                'durations': self.itv_durations_entry.get(),
+                'zoom_amplitude': self.itv_zoom_amplitude_entry.get(),
+                'zoom_speed': self.itv_zoom_speed_entry.get(),
+                'use_gpu': self.itv_use_gpu_switch.get()
+            },
+            # --- 新增：保存“绿幕合成-图片模式”的配置 ---
+            'gs_image_settings': {
+                'source_folder': self.gs_image_source_folder_entry.get(),
+                'bg_folder': self.gs_image_bg_folder_entry.get(),
+                'output_folder': self.gs_image_output_folder_entry.get(),
+                'num_groups': self.gs_image_num_groups_entry.get(),
+                'is_ai_mode': self.gs_image_mode_switch.get(),
+                'alpha_matting': self.gs_image_alpha_matting_switch.get(),
+                'fg_threshold': self.gs_image_fg_slider.get(),
+                'bg_threshold': self.gs_image_bg_slider.get(),
+                'threshold': self.gs_image_threshold_slider.get(),
+                'use_gpu': self.gs_image_gpu_switch.get()
+            },
 
             'ab_image_settings': {
                 'source_folder': self.ab_image_source_folder_entry.get(),
@@ -8598,6 +8911,31 @@ class App(ctk.CTk):
         _load_switch('image_flip_switch', imgs, 'allow_flip', True)
         _load_switch('image_no_bg_switch', imgs, 'no_background', False)
 
+        # --- 新增：加载“图转视频”的配置 ---
+        itv_s = settings.get('img_to_video_settings', {})
+        _load_entry('itv_image_folder_entry', itv_s, 'image_folder')
+        _load_entry('itv_output_folder_entry', itv_s, 'output_folder')
+        _load_switch('itv_single_mode_switch', itv_s, 'single_mode', True)  # 默认值为True
+        _load_entry('itv_num_groups_entry', itv_s, 'num_groups', '1')
+        _load_entry('itv_durations_entry', itv_s, 'durations')
+        _load_entry('itv_zoom_amplitude_entry', itv_s, 'zoom_amplitude', '0.05')
+        _load_entry('itv_zoom_speed_entry', itv_s, 'zoom_speed', '2.0')
+        _load_switch('itv_use_gpu_switch', itv_s, 'use_gpu')
+        if hasattr(self, 'itv_single_mode_switch'): self._toggle_itv_mode_widgets()  # 更新UI状态
+
+        # --- 新增：加载“绿幕合成-图片模式”的配置 ---
+        gs_img_s = settings.get('gs_image_settings', {})
+        _load_entry('gs_image_source_folder_entry', gs_img_s, 'source_folder')
+        _load_entry('gs_image_bg_folder_entry', gs_img_s, 'bg_folder')
+        _load_entry('gs_image_output_folder_entry', gs_img_s, 'output_folder')
+        _load_entry('gs_image_num_groups_entry', gs_img_s, 'num_groups', '10-6')
+        _load_switch('gs_image_mode_switch', gs_img_s, 'is_ai_mode', True)
+        _load_switch('gs_image_alpha_matting_switch', gs_img_s, 'alpha_matting', True)
+        _load_slider('gs_image_fg_slider', gs_img_s, 'fg_threshold', 240)
+        _load_slider('gs_image_bg_slider', gs_img_s, 'bg_threshold', 10)
+        _load_slider('gs_image_threshold_slider', gs_img_s, 'threshold', 170)
+        _load_switch('gs_image_gpu_switch', gs_img_s, 'use_gpu')
+        if hasattr(self, 'gs_image_mode_switch'): self._toggle_gs_image_mode_widgets()  # 更新UI状态
 
         ab_s = settings.get('ab_image_settings', {})
         _load_entry('ab_image_source_folder_entry', ab_s, 'source_folder')
