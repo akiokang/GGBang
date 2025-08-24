@@ -408,6 +408,7 @@ class App(ctk.CTk):
         self.ITV_PRESETS_FILE = get_persistent_settings_path("img_to_video_presets.json")
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
         self.VIDEO_PRESETS_FILE = get_persistent_settings_path("video_presets.json")
+        self.IMAGE_PRESETS_FILE = get_persistent_settings_path("image_presets.json")  # 新增: 图片处理的预设文件
         self.active_ffmpeg_process = None
         try:
             # cv2.data.haarcascades 会自动指向OpenCV库中存放模型文件的正确路径
@@ -455,8 +456,8 @@ class App(ctk.CTk):
 
         # 加载设置并设置窗口关闭行为
         self.load_settings()
-        self._video_populate_presets_dropdown()  # 新增：启动时加载视频预设
-
+        self._video_populate_presets_dropdown()
+        self._image_populate_presets_dropdown() # 新增: 启动时加载图片预设
         self._itv_populate_presets_dropdown()
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -6095,8 +6096,8 @@ class App(ctk.CTk):
         self.news_text_input_area.pack(fill="x", expand=True, padx=10, pady=(0, 10))
 
         # 这些辅助函数内部使用 .pack()，现在可以正常工作了
-        self.news_font_list = self._news_get_fonts()
-        self.create_option_menu_row(text_frame, "选择字体 (zt文件夹):", "news_font", self.news_font_list, self.news_font_list[0] if self.news_font_list else "")
+        self.create_widget_row(text_frame, "选择字体文件:", "news_font_file", "请点击右侧按钮选择字体文件...", is_file=True).pack(fill="x", padx=10, pady=2)
+
         self.create_color_picker_row(text_frame, "字体颜色:", "news_font_color", "#FFFFFF")
         self.create_color_picker_row(text_frame, "背景颜色:", "news_bg_color", "#FFFFFF")
         self.create_widget_row(text_frame, "字幕框宽度(px):", "news_box_w", "500").pack(fill="x", padx=10, pady=2)
@@ -6346,26 +6347,21 @@ class App(ctk.CTk):
             filter_complex_string = ";".join(filters)
             # --- 修改结束 ---
 
-            map_str = f'-map "{final_map}" -map 1:a?'
+            map_str = f'-map "{final_map}" -map 0:a?'
+
             codec_to_use = gpu_codec if use_gpu and self.is_gpu_available else 'libx264'
             codec_str = f"-c:v {codec_to_use} -preset medium -c:a aac -b:a 192k"
 
-            ffprobe_path = self._find_executable("ffprobe")
-            duration_str = ""
-            if ffprobe_path:
-                try:
-                    safe_ffprobe_path = f'"{os.path.normpath(ffprobe_path)}"'
-                    cmd_probe_str = f'{safe_ffprobe_path} -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{os.path.normpath(template_path)}"'
-                    duration_result = subprocess.run(cmd_probe_str, shell=True, check=True, capture_output=True,
-                                                     text=True, creationflags=creation_flags).stdout.strip()
-                    duration_str = f"-t {duration_result}"
-                except:
-                    pass
+            # --- 需求 2 修改点 ---
+            # 不再探测模板时长，直接使用传入的 crop_duration 作为最终输出时长
+            duration_str = f"-t {crop_duration}" if crop_duration > 0 else ""
 
-            command_string = f'{safe_ffmpeg_path} -y {crop_str} {inputs_str} -filter_complex "{filter_complex_string}" {map_str} {codec_str} {duration_str} {safe_output_path}'
+            # 最终命令中移除了开头的 crop_str，只使用结尾的 duration_str 来控制总时长
+            command_string = f'{safe_ffmpeg_path} -y {inputs_str} -filter_complex "{filter_complex_string}" {map_str} {codec_str} {duration_str} {safe_output_path}'
 
             self.log_news_greenscreen("  -> 正在调用FFmpeg核心进行高速合成...")
-            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8',
+                           errors='ignore',
                            creationflags=creation_flags)
 
             return True, f"成功保存到: {os.path.basename(output_path)}"
@@ -6421,7 +6417,8 @@ class App(ctk.CTk):
             content_dir = self.news_content_folder_entry.get()
             template_dir = self.news_template_folder_entry.get()
             output_dir = self.news_output_folder_entry.get()
-            # --- 核心修改：获取时长后自动加1 ---
+
+            # --- 参数获取部分 (与原版相同) ---
             try:
                 duration_str = self.news_crop_duration_entry.get()
                 original_duration = float(duration_str) if duration_str.strip() else 0
@@ -6434,29 +6431,20 @@ class App(ctk.CTk):
             except (ValueError, TypeError):
                 self.log_news_greenscreen("警告: 预裁剪时长输入无效，将不进行裁剪。")
                 crop_duration = 0
-            # --- 修改结束 ---
-            # --- 获取所有配置参数 (逻辑不变) ---
-            font_file = self.news_font_menu.get()
-            try:
-                duration_str = self.news_crop_duration_entry.get()
-                crop_duration = float(duration_str) if duration_str and float(duration_str) > 0 else 0
-            except (ValueError, TypeError):
-                crop_duration = 0
 
-            try:
-                base_path = sys._MEIPASS
-            except Exception:
-                base_path = os.path.abspath(os.path.dirname(__file__))
-            full_font_path = os.path.join(base_path, "zt", font_file)
+            full_font_path = self.news_font_file_entry.get()
 
-            if not (font_file and os.path.exists(full_font_path)):
-                self.log_news_greenscreen(f"错误: 选择的字体文件 '{font_file}' 无效或 'zt' 文件夹中不存在！")
+            # 更新验证逻辑
+            if not (full_font_path and os.path.exists(full_font_path)):
+                # 使用 os.path.basename 来只显示文件名，避免过长的路径刷屏
+                self.log_news_greenscreen(
+                    f"错误: 选择的字体文件 '{os.path.basename(full_font_path)}' 无效或路径不正确！")
                 return
 
             all_text_lines = [line.strip() for line in
                               self.news_text_input_area.get("1.0", "end-1c").strip().split('\n') if line.strip()]
             if not all_text_lines:
-                self.log_news_greenscreen("错误: 文案输入为空，无法进行一对一匹配。")
+                self.log_news_greenscreen("错误: 文案输入为空，无法进行处理。")
                 return
 
             use_gpu = self.news_use_gpu_switch.get() == 1
@@ -6466,53 +6454,13 @@ class App(ctk.CTk):
             else:
                 self.log_news_greenscreen("*** 将使用CPU进行编码 ***")
 
-            # --- 核心修复：恢复正确的文件夹扫描和矩阵式任务列表构建逻辑 ---
-            video_ext = ('.mp4', '.mov', '.avi', '.mkv')
-            content_files = sorted([f for f in os.listdir(content_dir) if f.lower().endswith(video_ext)])
-
-            # 1. 扫描模板文件夹下的子文件夹
-            template_subfolders = sorted(
-                [d for d in os.listdir(template_dir) if os.path.isdir(os.path.join(template_dir, d))])
-
-            if not content_files:
-                self.log_news_greenscreen("错误：内容文件夹中没有任何视频文件！")
-                return
-            if not template_subfolders:
-                self.log_news_greenscreen("错误：模板文件夹中不包含任何子文件夹！")
-                return
-
-            # 2. 构建包含所有组合的任务列表
-            task_list = []
-            for subfolder_name in template_subfolders:
-                template_folder_path = os.path.join(template_dir, subfolder_name)
-                template_files = sorted([f for f in os.listdir(template_folder_path) if f.lower().endswith(video_ext)])
-                if not template_files: continue
-                # 对于每个内容视频，都与当前子文件夹的所有模板视频进行配对
-                for content_filename in content_files:
-                    for template_filename in template_files:
-                        task_list.append({
-                            'subfolder': subfolder_name,
-                            'content': content_filename,
-                            'template': template_filename
-                        })
-
-            if not task_list:
-                self.log_news_greenscreen("错误：在模板子文件夹中未找到任何视频文件。")
-                return
-
-            # 3. 以任务总数和文案总数中的较小者，确定最终处理数量
-            num_tasks = min(len(task_list), len(all_text_lines))
-            self.log_news_greenscreen(
-                f"\n★★★ 模板设置完成！检测到 {len(task_list)} 个潜在合成任务和 {len(all_text_lines)} 行文案，将处理 {num_tasks} 个任务。 ★★★")
-            # --- 修复结束 ---
-            # --- 新增：从UI获取镜像和放大参数 ---
             mirror_content = self.news_mirror_switch.get() == 1
             try:
                 zoom_factor = float(self.news_zoom_entry.get())
                 if zoom_factor < 1.0: zoom_factor = 1.0
             except (ValueError, TypeError):
                 zoom_factor = 1.0
-            # --- 新增结束 ---
+
             text_config = {
                 'y_offset': int(self.news_y_offset_entry.get()), 'box_w': int(self.news_box_w_entry.get()),
                 'box_h': int(self.news_box_h_entry.get()), 'font_color': self.news_font_color_value,
@@ -6520,43 +6468,86 @@ class App(ctk.CTk):
                 'corner_radius': int(self.news_corner_radius_entry.get())
             }
 
-            for i in range(num_tasks):
-                if self.news_stop_event.is_set():
-                    self.log_news_greenscreen("🔴 任务已由用户中止。")
-                    break
+            # --- 核心修改点：重构任务生成与主循环 ---
 
-                try:
-                    # 从任务列表中按顺序取出一个任务
-                    task = task_list[i]
-                    current_text = all_text_lines[i]
+            video_ext = ('.mp4', '.mov', '.avi', '.mkv')
+            content_files = sorted([f for f in os.listdir(content_dir) if f.lower().endswith(video_ext)])
+            template_subfolders = sorted(
+                [d for d in os.listdir(template_dir) if os.path.isdir(os.path.join(template_dir, d))])
 
-                    self.log_news_greenscreen(f"\n--- 任务进度: {i + 1}/{num_tasks} ---")
-                    content_path = os.path.join(content_dir, task['content'])
-                    template_path = os.path.join(template_dir, task['subfolder'], task['template'])
+            if not content_files: self.log_news_greenscreen("错误：内容文件夹中没有任何视频文件！"); return
+            if not template_subfolders: self.log_news_greenscreen("错误：模板文件夹中不包含任何子文件夹！"); return
 
-                    # 构建正确的输出路径
-                    output_subfolder_path = os.path.join(output_dir, task['subfolder'])
-                    os.makedirs(output_subfolder_path, exist_ok=True)
-                    output_basename = f"{os.path.splitext(task['content'])[0]}_on_{os.path.splitext(task['template'])[0]}.mp4"
-                    output_path = os.path.join(output_subfolder_path, output_basename)
+            self.log_news_greenscreen(
+                f"\n★★★ 模板设置完成！将为 {len(template_subfolders)} 个模板子文件夹分别生成视频。 ★★★")
 
-                    self.log_news_greenscreen(f"正在合成: '{task['content']}' -> '{task['template']}'")
-                    self.log_news_greenscreen(f"添加文案: {current_text}")
+            # 1. 外层循环：遍历每一个模板子文件夹
+            for subfolder_name in template_subfolders:
+                if self.news_stop_event.is_set(): break
+                self.log_news_greenscreen(f"\n\n---=== 开始处理模板组: {subfolder_name} ===---")
 
-                    text_config['text'] = current_text
-                    success, message = self._news_process_video(
-                        content_path, template_path, output_path,
-                        template_content_roi, text_config,
-                        use_gpu, gpu_codec, crop_duration,
-                        mirror_content, zoom_factor
-                    )
-                    self.log_news_greenscreen(f"✔️ {message}" if success else f"❌ {message}")
-                except Exception as e:
-                    self.log_news_greenscreen(f"处理任务 {i + 1} 时发生未知严重错误: {e}")
+                template_folder_path = os.path.join(template_dir, subfolder_name)
+                template_files_in_subfolder = sorted(
+                    [f for f in os.listdir(template_folder_path) if f.lower().endswith(video_ext)])
+
+                if not template_files_in_subfolder:
+                    self.log_news_greenscreen(f"  -> 警告: 模板子文件夹 '{subfolder_name}' 为空，已跳过。")
+                    continue
+
+                # 2. 在子文件夹内部，构建当前组的任务列表
+                subfolder_task_list = []
+                for content_filename in content_files:
+                    for template_filename in template_files_in_subfolder:
+                        subfolder_task_list.append({
+                            'subfolder': subfolder_name,
+                            'content': content_filename,
+                            'template': template_filename
+                        })
+
+                # 3. 独立计算当前子文件夹需要处理的任务数量
+                num_tasks_for_subfolder = min(len(subfolder_task_list), len(all_text_lines))
+                self.log_news_greenscreen(
+                    f"  -> 此组将使用 {len(all_text_lines)} 条文案，生成 {num_tasks_for_subfolder} 个视频。")
+                if num_tasks_for_subfolder == 0: continue
+
+                # 4. 内层循环：处理当前子文件夹的所有任务
+                for i in range(num_tasks_for_subfolder):
+                    if self.news_stop_event.is_set(): break
+
+                    try:
+                        task = subfolder_task_list[i]
+                        current_text = all_text_lines[i]
+
+                        self.log_news_greenscreen(f"\n--- 任务进度: {i + 1}/{num_tasks_for_subfolder} ---")
+                        content_path = os.path.join(content_dir, task['content'])
+                        template_path = os.path.join(template_dir, task['subfolder'], task['template'])
+
+                        output_subfolder_path = os.path.join(output_dir, task['subfolder'])
+                        os.makedirs(output_subfolder_path, exist_ok=True)
+                        output_basename = f"{os.path.splitext(task['content'])[0]}_on_{os.path.splitext(task['template'])[0]}.mp4"
+                        output_path = os.path.join(output_subfolder_path, output_basename)
+
+                        self.log_news_greenscreen(f"正在合成: '{task['content']}' -> '{task['template']}'")
+                        self.log_news_greenscreen(f"添加文案: {current_text}")
+
+                        text_config['text'] = current_text
+                        success, message = self._news_process_video(
+                            content_path, template_path, output_path,
+                            template_content_roi, text_config,
+                            use_gpu, gpu_codec, crop_duration,
+                            mirror_content, zoom_factor
+                        )
+                        self.log_news_greenscreen(f"✔️ {message}" if success else f"❌ {message}")
+                    except Exception as e:
+                        self.log_news_greenscreen(f"处理任务 {i + 1} 时发生未知严重错误: {e}")
+
+                if self.news_stop_event.is_set(): break
 
             if not self.news_stop_event.is_set():
                 self.log_news_greenscreen(
                     "\n===================================\n🎉 所有任务处理完毕！🎉\n===================================")
+            else:
+                self.log_news_greenscreen("🔴 任务已由用户中止。")
 
         except Exception as e:
             self.log_news_greenscreen(f"发生未预料的严重错误: {e}")
@@ -6958,6 +6949,23 @@ class App(ctk.CTk):
         self.ab_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9")
         self.ab_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
     def setup_video_main_tab(self, tab):
+        # --- 新增：预设管理模块 ---
+        preset_frame = ctk.CTkFrame(tab)
+        preset_frame.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(preset_frame, text="模式类型:", width=80).pack(side="left", padx=(10,5))
+        self.video_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._video_load_preset)
+        self.video_preset_menu.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.video_preset_title_entry = ctk.CTkEntry(preset_frame, placeholder_text="在此输入新模式名称以保存")
+        self.video_preset_title_entry.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.video_save_preset_button = ctk.CTkButton(preset_frame, text="保存配置", width=80, command=self._video_save_preset)
+        self.video_save_preset_button.pack(side="left", padx=5)
+
+        self.video_delete_preset_button = ctk.CTkButton(preset_frame, text="删除", width=60, command=self._video_delete_preset, fg_color="#D32F2F", hover_color="#B71C1C")
+        self.video_delete_preset_button.pack(side="left", padx=(5, 10))
+        # --- 预设模块结束 ---
+
         self.create_folder_selection_row(tab, "视频文件夹:", "选择包含视频的文件夹", "video_folder_entry")
         self.create_folder_selection_row(tab, "输出文件夹:", "选择视频处理结果的存放位置", "video_output_folder_entry")
         duration_frame = ctk.CTkFrame(tab, fg_color="transparent")
@@ -6968,33 +6976,29 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab, text="输入文案 (用'/'换行, 用'&'分隔块):").pack(anchor="w", padx=10, pady=(10, 0))
         self.video_text_input_box = ctk.CTkTextbox(tab, height=150); self.video_text_input_box.pack(fill="x", padx=10, pady=(5,10), expand=True)
 
-        # --- 核心修改：增加手机序号输入框并绑定事件 ---
         group_frame = ctk.CTkFrame(tab, fg_color="transparent")
         group_frame.pack(fill="x", padx=10, pady=5)
         self.create_widget_row(group_frame, "生成组数:", "video_num_groups", "1").pack(fill="x", padx=10, pady=2)
         self.create_widget_row(group_frame, "手机序号(用.分隔):", "video_phone_serial", "",
                                placeholder="例如: A-1.A-2.B-1").pack(fill="x", padx=10, pady=2)
 
-        # 绑定互斥事件
         self.video_num_groups_entry.bind("<KeyRelease>",
                                          lambda event: self._update_exclusive_entry_state(self.video_num_groups_entry,
                                                                                           self.video_phone_serial_entry))
         self.video_phone_serial_entry.bind("<KeyRelease>", lambda event: self._update_exclusive_entry_state(
             self.video_phone_serial_entry, self.video_num_groups_entry))
-        # --- 修改结束 ---
-        # --- 新增：随机混剪开关 ---
+
         switches_frame = ctk.CTkFrame(tab, fg_color="transparent")
         switches_frame.pack(fill="x", padx=10, pady=5, anchor="w")
 
         self.video_random_remix_switch = ctk.CTkSwitch(switches_frame, text="随机混剪模式")
         self.video_random_remix_switch.grid(row=0, column=0, sticky="w", padx=(0, 20))
-        # --- 修改结束 ---
+
         self.video_use_gpu_switch = ctk.CTkSwitch(tab, text="使用GPU加速编码 (需NVIDIA显卡)"); self.video_use_gpu_switch.pack(anchor="w", padx=10, pady=5)
         button_frame = ctk.CTkFrame(tab, fg_color="transparent"); button_frame.pack(fill="x", padx=10, pady=10); button_frame.grid_columnconfigure((0,1), weight=1)
         self.start_video_button = ctk.CTkButton(button_frame, text="开始处理视频", height=40, command=self.start_video_processing_hybrid); self.start_video_button.grid(row=0, column=0, padx=(0,5), sticky="ew")
         self.stop_video_button = ctk.CTkButton(button_frame, text="停止处理", height=40, command=self.stop_video_processing, state="disabled", fg_color="red", hover_color="darkred"); self.stop_video_button.grid(row=0, column=1, padx=(5,0), sticky="ew")
         self.video_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9"); self.video_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
-
     def _create_random_remix_clip(self, target_duration, available_videos, temp_dir, logger):
         """【最终版 - FFmpeg核心 - 即时修正MOV】根据目标时长，随机抽取、修正并拼接视频片段"""
         logger(f"  -> [混剪] 目标时长: {target_duration:.2f}s。开始构建FFmpeg混剪任务...")
@@ -7104,18 +7108,33 @@ class App(ctk.CTk):
 
     # 请用这个版本完整替换你的 setup_image_main_tab 函数
     def setup_image_main_tab(self, tab):
-        # --- 新增：单一模式开关 ---
+        # --- 新增：图片处理预设管理模块 ---
+        preset_frame = ctk.CTkFrame(tab)
+        preset_frame.pack(fill="x", padx=10, pady=10)
+        ctk.CTkLabel(preset_frame, text="模式类型:", width=80).pack(side="left", padx=(10,5))
+        self.image_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._image_load_preset)
+        self.image_preset_menu.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.image_preset_title_entry = ctk.CTkEntry(preset_frame, placeholder_text="在此输入新模式名称以保存")
+        self.image_preset_title_entry.pack(side="left", expand=True, fill="x", padx=5)
+
+        self.image_save_preset_button = ctk.CTkButton(preset_frame, text="保存配置", width=80, command=self._image_save_preset)
+        self.image_save_preset_button.pack(side="left", padx=5)
+
+        self.image_delete_preset_button = ctk.CTkButton(preset_frame, text="删除", width=60, command=self._image_delete_preset, fg_color="#D32F2F", hover_color="#B71C1C")
+        self.image_delete_preset_button.pack(side="left", padx=(5, 10))
+        # --- 预设模块结束 ---
+
         mode_switch_frame = ctk.CTkFrame(tab, fg_color="transparent")
         mode_switch_frame.pack(fill="x", padx=10, pady=(10, 5))
         ctk.CTkLabel(mode_switch_frame, text="处理模式:", width=120, anchor="w").pack(side="left")
         self.image_single_mode_switch = ctk.CTkSwitch(
             mode_switch_frame,
             text="单一模式 (使用单一底片文件夹)",
-            command=self._toggle_image_processing_mode  # 绑定切换函数
+            command=self._toggle_image_processing_mode
         )
         self.image_single_mode_switch.pack(anchor="w")
 
-        # --- 新增：单一底片文件夹输入行 ---
         self.single_base_folder_row = self.create_folder_selection_row(
             tab,
             "单一底片文件夹:",
@@ -7123,9 +7142,7 @@ class App(ctk.CTk):
             "image_single_base_folder_entry",
             return_frame=True
         )
-        # self.single_base_folder_row 已经被 create_folder_selection_row pack 过了
 
-        # --- 原有的UI控件 ---
         self.create_folder_selection_row(tab, "图片文件夹:", "选择包含图片的文件夹", "image_folder_entry")
         self.create_folder_selection_row(tab, "输出文件夹:", "选择图片处理结果的存放位置", "image_output_folder_entry")
 
@@ -7158,7 +7175,6 @@ class App(ctk.CTk):
         self.image_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9")
         self.image_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
 
-        # --- 新增：初始化UI状态 ---
         self._toggle_image_processing_mode()
 
     def _video_delete_preset(self):
@@ -7201,71 +7217,58 @@ class App(ctk.CTk):
 
         except (FileNotFoundError, json.JSONDecodeError):
             self.log_video("❌ 删除失败: 找不到或无法解析预设文件。")
+
     def setup_video_settings_tab(self, tab):
-        tab.grid_rowconfigure(0, weight=1); tab.grid_columnconfigure(0, weight=1)
-        scrollable_frame = ctk.CTkScrollableFrame(tab, label_text="视频字幕的所有参数均在此配置"); scrollable_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        # --- 修改后的预设管理模块 ---
-        preset_frame = ctk.CTkFrame(scrollable_frame)
-        preset_frame.pack(fill="x", padx=10, pady=10)
-        preset_frame.grid_columnconfigure(1, weight=1)  # 让下拉框占据更多空间
+        tab.grid_rowconfigure(0, weight=1);
+        tab.grid_columnconfigure(0, weight=1)
+        scrollable_frame = ctk.CTkScrollableFrame(tab, label_text="视频字幕的所有参数均在此配置");
+        scrollable_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
 
-        ctk.CTkLabel(preset_frame, text="模式类型:").grid(row=0, column=0, padx=(10, 5), sticky="w")
-        self.video_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._video_load_preset)
-        self.video_preset_menu.grid(row=0, column=1, sticky="ew", padx=5)
+        # --- 预设管理模块已被移动到主页 ---
 
-        self.video_save_preset_button = ctk.CTkButton(preset_frame, text="保存当前配置", width=120,
-                                                      command=self._video_save_preset)
-        self.video_save_preset_button.grid(row=0, column=2, padx=5)
-
-        # --- 新增的删除按钮 ---
-        self.video_delete_preset_button = ctk.CTkButton(preset_frame, text="删除", width=60,
-                                                        command=self._video_delete_preset, fg_color="#D32F2F",
-                                                        hover_color="#B71C1C")
-        self.video_delete_preset_button.grid(row=0, column=3, padx=(5, 10))
-        # --- UI修改结束 ---
-
-        ctk.CTkLabel(preset_frame, text="模式类型:").grid(row=0, column=0, padx=(10, 5))
-        self.video_preset_menu = ctk.CTkOptionMenu(preset_frame, values=["无预设"], command=self._video_load_preset)
-        self.video_preset_menu.grid(row=0, column=1, sticky="ew", padx=5)
-
-        self.video_save_preset_button = ctk.CTkButton(preset_frame, text="保存当前配置", width=120,
-                                                      command=self._video_save_preset)
-        self.video_save_preset_button.grid(row=0, column=2, padx=(5, 10))
-        # --- 新增结束 ---
-        shared_frame = ctk.CTkFrame(scrollable_frame, border_width=1); shared_frame.pack(fill="x", padx=10, pady=10)
+        shared_frame = ctk.CTkFrame(scrollable_frame, border_width=1);
+        shared_frame.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(shared_frame, text="--- 视频 · 共享样式 ---", font=ctk.CTkFont(weight="bold")).pack(pady=5)
         default_video_font_path = get_resource_path(os.path.join('assets', 'WenYue_XinQingNianTi_J-W8.otf'))
-        self.create_widget_row(shared_frame, "字体文件:", "video_shared_font_file", default_video_font_path, True).pack(fill="x", padx=10, pady=2)
+        self.create_widget_row(shared_frame, "字体文件:", "video_shared_font_file", default_video_font_path, True).pack(
+            fill="x", padx=10, pady=2)
         self.create_widget_row(shared_frame, "字体大小:", "video_shared_size", "60").pack(fill="x", padx=10, pady=2)
-        self.create_widget_row(shared_frame, "最大宽度比例:", "video_shared_max_width_ratio", "0.9").pack(fill="x", padx=10, pady=2)
-        self.create_widget_row(shared_frame, "左右内边距:", "video_shared_padding_horizontal", "30").pack(fill="x", padx=10, pady=2)
-        self.create_widget_row(shared_frame, "垂直内边距:", "video_shared_padding_vertical", "25").pack(fill="x", padx=10, pady=2)
-        self.create_widget_row(shared_frame, "描边粗细:", "video_shared_stroke_width", "2").pack(fill="x", padx=10, pady=2)
-        self.create_widget_row(shared_frame, "背景圆角半径:", "video_shared_corner_radius", "20").pack(fill="x", padx=10, pady=2)
+        self.create_widget_row(shared_frame, "最大宽度比例:", "video_shared_max_width_ratio", "0.9").pack(fill="x",
+                                                                                                          padx=10,
+                                                                                                          pady=2)
+        self.create_widget_row(shared_frame, "左右内边距:", "video_shared_padding_horizontal", "30").pack(fill="x",
+                                                                                                          padx=10,
+                                                                                                          pady=2)
+        self.create_widget_row(shared_frame, "垂直内边距:", "video_shared_padding_vertical", "25").pack(fill="x",
+                                                                                                        padx=10, pady=2)
+        self.create_widget_row(shared_frame, "描边粗细:", "video_shared_stroke_width", "2").pack(fill="x", padx=10,
+                                                                                                 pady=2)
+        self.create_widget_row(shared_frame, "背景圆角半径:", "video_shared_corner_radius", "20").pack(fill="x",
+                                                                                                       padx=10, pady=2)
         self.video_no_bg_switch = ctk.CTkSwitch(shared_frame, text="禁用所有字幕背景")
         self.video_no_bg_switch.pack(pady=10, padx=10, anchor="w")
-        # --- 在这里添加新开关 ---
         self.video_line_by_line_bg_switch = ctk.CTkSwitch(shared_frame, text="启用逐行背景 (解决缩进)")
         self.video_line_by_line_bg_switch.pack(pady=(0, 10), padx=10, anchor="w")
-        # --- 添加结束 ---
 
-        main_frame = ctk.CTkFrame(scrollable_frame, border_width=1); main_frame.pack(fill="x", padx=10, pady=10)
+        main_frame = ctk.CTkFrame(scrollable_frame, border_width=1);
+        main_frame.pack(fill="x", padx=10, pady=10)
         ctk.CTkLabel(main_frame, text="--- 视频 · 主文案 ---", font=ctk.CTkFont(weight="bold")).pack(pady=5)
-        self.create_widget_row(main_frame, "水平位置 (x):", "video_main_pos_x", "center").pack(fill="x", padx=10, pady=2)
+        self.create_widget_row(main_frame, "水平位置 (x):", "video_main_pos_x", "center").pack(fill="x", padx=10,
+                                                                                               pady=2)
         self.create_widget_row(main_frame, "垂直位置 (y):", "video_main_pos_y", "150").pack(fill="x", padx=10, pady=2)
         self.create_color_picker_row(main_frame, "文字颜色:", "video_main_color_text", "white")
         self.create_color_picker_row(main_frame, "描边颜色:", "video_main_color_stroke", "black")
         self.create_color_picker_row(main_frame, "背景颜色:", "video_main_color_bg", "rgba(0, 0, 0, 0.5)")
         for i in range(1, 3):
-            sub_frame = ctk.CTkFrame(scrollable_frame, border_width=1); sub_frame.pack(fill="x", padx=10, pady=10)
+            sub_frame = ctk.CTkFrame(scrollable_frame, border_width=1);
+            sub_frame.pack(fill="x", padx=10, pady=10)
             ctk.CTkLabel(sub_frame, text=f"--- 视频 · 次文案 {i} ---", font=ctk.CTkFont(weight="bold")).pack(pady=5)
             defaults = [("20", "#FFD700", "black", "rgba(200,50,50)"), ("30", "white", "black", "rgba(50,50,50)")]
-            self.create_widget_row(sub_frame, "相对Y轴偏移:", f"video_sub{i}_offset_y", defaults[i-1][0]).pack(fill="x", padx=10, pady=2)
-            self.create_color_picker_row(sub_frame, "文字颜色:", f"video_sub{i}_color_text", defaults[i-1][1])
-            self.create_color_picker_row(sub_frame, "描边颜色:", f"video_sub{i}_color_stroke", defaults[i-1][2])
-            self.create_color_picker_row(sub_frame, "背景颜色:", f"video_sub{i}_color_bg", defaults[i-1][3])
-
-
+            self.create_widget_row(sub_frame, "相对Y轴偏移:", f"video_sub{i}_offset_y", defaults[i - 1][0]).pack(
+                fill="x", padx=10, pady=2)
+            self.create_color_picker_row(sub_frame, "文字颜色:", f"video_sub{i}_color_text", defaults[i - 1][1])
+            self.create_color_picker_row(sub_frame, "描边颜色:", f"video_sub{i}_color_stroke", defaults[i - 1][2])
+            self.create_color_picker_row(sub_frame, "背景颜色:", f"video_sub{i}_color_bg", defaults[i - 1][3])
     # --- 新增：视频处理预设功能模块 ---
     def _video_populate_presets_dropdown(self):
         """读取预设文件并更新下拉菜单"""
@@ -7390,6 +7393,327 @@ class App(ctk.CTk):
             self.log_video(f"ℹ️ 已加载预设 '{preset_name}'。")
         except (FileNotFoundError, json.JSONDecodeError) as e:
             self.log_video(f"❌ 加载预设失败: {e}")
+
+    def _get_all_video_preset_data(self):
+        """获取视频处理主页和参数配置页的所有数据"""
+        # 1. 从参数配置页获取数据
+        settings_data = self.get_video_config_from_gui()
+        if not settings_data:
+            return None  # 如果参数配置有错，则终止
+
+        # 2. 从主页获取数据
+        main_page_data = {
+            'folder_path': self.video_folder_entry.get(),
+            'output_path': self.video_output_folder_entry.get(),
+            'durations': self.video_durations_entry.get(),
+            'text_input': self.video_text_input_box.get("1.0", "end-1c"),
+            'num_groups': self.video_num_groups_entry.get(),
+            'phone_serial': self.video_phone_serial_entry.get(),
+            'random_remix': self.video_random_remix_switch.get(),
+            'use_gpu': self.video_use_gpu_switch.get()
+        }
+
+        # 3. 合并数据
+        # 将主页数据作为顶层键，参数配置数据作为子键，避免键名冲突
+        combined_data = {
+            'main_page': main_page_data,
+            'settings_page': settings_data
+        }
+        return combined_data
+
+    def _video_save_preset(self):
+        """增强版：保存当前视频主页和参数配置为新预设"""
+        title = self.video_preset_title_entry.get().strip()
+        if not title:
+            tk_messagebox.showwarning("提示", "请输入一个新模式的名称来保存配置。")
+            return
+
+        current_config = self._get_all_video_preset_data()
+        if not current_config:
+            self.log_video("❌ 保存失败，无法获取当前配置。")
+            return
+
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            presets = {}
+
+        presets[title] = current_config
+
+        with open(self.VIDEO_PRESETS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(presets, f, indent=4, ensure_ascii=False)
+
+        self.log_video(f"✅ 预设 '{title}' 已成功保存。")
+        self.video_preset_title_entry.delete(0, 'end')
+        self._video_populate_presets_dropdown()
+        self.video_preset_menu.set(title)
+
+    def _video_load_preset(self, preset_name):
+        """增强版：根据选择的预设名称，加载并应用主页和参数配置"""
+        if preset_name == "无预设": return
+        try:
+            with open(self.VIDEO_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+
+            config = presets.get(preset_name)
+            if not config:
+                self.log_video(f"❌ 加载失败，找不到名为 '{preset_name}' 的预设。");
+                return
+
+            # --- 加载主页配置 ---
+            main_config = config.get('main_page', {})
+            self.video_folder_entry.delete(0, 'end');
+            self.video_folder_entry.insert(0, main_config.get('folder_path', ''))
+            self.video_output_folder_entry.delete(0, 'end');
+            self.video_output_folder_entry.insert(0, main_config.get('output_path', ''))
+            self.video_durations_entry.delete(0, 'end');
+            self.video_durations_entry.insert(0, main_config.get('durations', ''))
+            self.video_text_input_box.delete("1.0", "end");
+            self.video_text_input_box.insert("1.0", main_config.get('text_input', ''))
+            self.video_num_groups_entry.delete(0, 'end');
+            self.video_num_groups_entry.insert(0, main_config.get('num_groups', '1'))
+            self.video_phone_serial_entry.delete(0, 'end');
+            self.video_phone_serial_entry.insert(0, main_config.get('phone_serial', ''))
+            if main_config.get('random_remix', 0) == 1:
+                self.video_random_remix_switch.select()
+            else:
+                self.video_random_remix_switch.deselect()
+            if main_config.get('use_gpu', 0) == 1:
+                self.video_use_gpu_switch.select()
+            else:
+                self.video_use_gpu_switch.deselect()
+
+            # --- 加载参数配置页 (复用旧逻辑) ---
+            settings_config = config.get('settings_page', {})
+            ss_config = settings_config.get('共享样式', {})
+            self.video_shared_font_file_entry.delete(0, 'end');
+            self.video_shared_font_file_entry.insert(0, ss_config.get('字体文件', ''))
+            self.video_shared_size_entry.delete(0, 'end');
+            self.video_shared_size_entry.insert(0, str(ss_config.get('字体大小', '60')))
+            self.video_shared_max_width_ratio_entry.delete(0, 'end');
+            self.video_shared_max_width_ratio_entry.insert(0, str(ss_config.get('最大宽度比例', '0.9')))
+            self.video_shared_padding_horizontal_entry.delete(0, 'end');
+            self.video_shared_padding_horizontal_entry.insert(0, str(ss_config.get('左右内边距', '30')))
+            self.video_shared_padding_vertical_entry.delete(0, 'end');
+            self.video_shared_padding_vertical_entry.insert(0, str(ss_config.get('垂直内边距', '25')))
+            self.video_shared_stroke_width_entry.delete(0, 'end');
+            self.video_shared_stroke_width_entry.insert(0, str(ss_config.get('描边粗细', '2')))
+            self.video_shared_corner_radius_entry.delete(0, 'end');
+            self.video_shared_corner_radius_entry.insert(0, str(ss_config.get('背景圆角半径', '20')))
+            if ss_config.get('禁用背景', False):
+                self.video_no_bg_switch.select()
+            else:
+                self.video_no_bg_switch.deselect()
+            if ss_config.get('启用逐行背景', False):
+                self.video_line_by_line_bg_switch.select()
+            else:
+                self.video_line_by_line_bg_switch.deselect()
+
+            main_text_config = settings_config.get('主文案', {})
+            main_pos = main_text_config.get('位置', {})
+            self.video_main_pos_x_entry.delete(0, 'end');
+            self.video_main_pos_x_entry.insert(0, str(main_pos.get('水平位置 (x)', 'center')))
+            self.video_main_pos_y_entry.delete(0, 'end');
+            self.video_main_pos_y_entry.insert(0, str(main_pos.get('垂直位置 (y)', '150')))
+            main_colors = main_text_config.get('颜色', {})
+            self._update_color_widget('video_main_color_text', main_colors.get('文字颜色', 'white'))
+            self._update_color_widget('video_main_color_stroke', main_colors.get('描边颜色', 'black'))
+            self._update_color_widget('video_main_color_bg', main_colors.get('背景颜色', 'rgba(0,0,0,0.5)'))
+
+            sub_configs = settings_config.get('次文案', [{}, {}])
+            if len(sub_configs) > 0:
+                sub1_config = sub_configs[0];
+                sub1_colors = sub1_config.get('颜色', {})
+                self.video_sub1_offset_y_entry.delete(0, 'end');
+                self.video_sub1_offset_y_entry.insert(0, str(sub1_config.get('相对Y轴偏移', '20')))
+                self._update_color_widget('video_sub1_color_text', sub1_colors.get('文字颜色', '#FFD700'))
+                self._update_color_widget('video_sub1_color_stroke', sub1_colors.get('描边颜色', 'black'))
+                self._update_color_widget('video_sub1_color_bg', sub1_colors.get('背景颜色', 'rgba(200,50,50,1)'))
+            if len(sub_configs) > 1:
+                sub2_config = sub_configs[1];
+                sub2_colors = sub2_config.get('颜色', {})
+                self.video_sub2_offset_y_entry.delete(0, 'end');
+                self.video_sub2_offset_y_entry.insert(0, str(sub2_config.get('相对Y轴偏移', '30')))
+                self._update_color_widget('video_sub2_color_text', sub2_colors.get('文字颜色', 'white'))
+                self._update_color_widget('video_sub2_color_stroke', sub2_colors.get('描边颜色', 'black'))
+                self._update_color_widget('video_sub2_color_bg', sub2_colors.get('背景颜色', 'rgba(50,50,50,1)'))
+
+            self.log_video(f"ℹ️ 已加载预设 '{preset_name}'。")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            self.log_video(f"❌ 加载预设失败: {e}")
+
+    # --- 新增：图片处理预设功能模块 ---
+    def _image_populate_presets_dropdown(self):
+        """读取图片预设文件并更新下拉菜单"""
+        try:
+            with open(self.IMAGE_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+            titles = list(presets.keys())
+            if not titles: titles = ["无预设"]
+            self.image_preset_menu.configure(values=titles)
+            if titles: self.image_preset_menu.set(titles[0])
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.image_preset_menu.configure(values=["无预设"])
+            self.image_preset_menu.set("无预设")
+
+    def _get_all_image_preset_data(self):
+        """获取图片处理主页和参数配置页的所有数据"""
+        settings_data = self.get_image_config_from_gui()
+        if not settings_data: return None
+
+        main_page_data = {
+            'single_mode': self.image_single_mode_switch.get(),
+            'single_base_folder': self.image_single_base_folder_entry.get(),
+            'folder_path': self.image_folder_entry.get(),
+            'output_path': self.image_output_folder_entry.get(),
+            'text_input': self.image_text_input_box.get("1.0", "end-1c"),
+            'num_groups': self.image_num_groups_entry.get(),
+            'phone_serial': self.image_phone_serial_entry.get(),
+        }
+        return {'main_page': main_page_data, 'settings_page': settings_data}
+
+    def _image_save_preset(self):
+        """保存当前图片主页和参数配置为新预设"""
+        title = self.image_preset_title_entry.get().strip()
+        if not title:
+            tk_messagebox.showwarning("提示", "请输入一个新模式的名称来保存配置。")
+            return
+
+        current_config = self._get_all_image_preset_data()
+        if not current_config:
+            self.log_image("❌ 保存失败，无法获取当前配置。")
+            return
+
+        try:
+            with open(self.IMAGE_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            presets = {}
+
+        presets[title] = current_config
+        with open(self.IMAGE_PRESETS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(presets, f, indent=4, ensure_ascii=False)
+
+        self.log_image(f"✅ 预设 '{title}' 已成功保存。")
+        self.image_preset_title_entry.delete(0, 'end')
+        self._image_populate_presets_dropdown()
+        self.image_preset_menu.set(title)
+
+    def _image_load_preset(self, preset_name):
+        """根据选择的预设名称，加载并应用图片的主页和参数配置"""
+        if preset_name == "无预设": return
+        try:
+            with open(self.IMAGE_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+            config = presets.get(preset_name)
+            if not config:
+                self.log_image(f"❌ 加载失败，找不到名为 '{preset_name}' 的预设。");
+                return
+
+            # 加载主页
+            main_config = config.get('main_page', {})
+            if main_config.get('single_mode', 0) == 1:
+                self.image_single_mode_switch.select()
+            else:
+                self.image_single_mode_switch.deselect()
+            self._toggle_image_processing_mode()
+            self.image_single_base_folder_entry.delete(0, 'end');
+            self.image_single_base_folder_entry.insert(0, main_config.get('single_base_folder', ''))
+            self.image_folder_entry.delete(0, 'end');
+            self.image_folder_entry.insert(0, main_config.get('folder_path', ''))
+            self.image_output_folder_entry.delete(0, 'end');
+            self.image_output_folder_entry.insert(0, main_config.get('output_path', ''))
+            self.image_text_input_box.delete("1.0", "end");
+            self.image_text_input_box.insert("1.0", main_config.get('text_input', ''))
+            self.image_num_groups_entry.delete(0, 'end');
+            self.image_num_groups_entry.insert(0, main_config.get('num_groups', '1'))
+            self.image_phone_serial_entry.delete(0, 'end');
+            self.image_phone_serial_entry.insert(0, main_config.get('phone_serial', ''))
+
+            # 加载参数配置页
+            settings_config = config.get('settings_page', {})
+            if settings_config.get('no_background', False):
+                self.image_no_bg_switch.select()
+            else:
+                self.image_no_bg_switch.deselect()
+
+            main_text_config = settings_config.get('main_text', {})
+            self.image_font_path_entry.delete(0, 'end');
+            self.image_font_path_entry.insert(0, main_text_config.get('font_path', ''))
+            self.image_font_size_entry.delete(0, 'end');
+            self.image_font_size_entry.insert(0, str(main_text_config.get('font_size', 75)))
+            self._update_color_widget('image_font_color', main_text_config.get('font_color', '#FFFFFF'))
+            self._update_color_widget('image_font_background_color',
+                                      main_text_config.get('font_background_color', '#FFFFFF'))
+
+            sub_text_config = settings_config.get('sub_text', {})
+            self.image_sub_offset_y_entry.delete(0, 'end');
+            self.image_sub_offset_y_entry.insert(0, str(sub_text_config.get('relative_y_offset', 20)))
+            self._update_color_widget('image_sub_color_text', sub_text_config.get('font_color', '#FFD700'))
+            self._update_color_widget('image_sub_color_bg', sub_text_config.get('font_background_color', '#FFFFFF'))
+
+            self.image_max_text_width_ratio_entry.delete(0, 'end');
+            self.image_max_text_width_ratio_entry.insert(0, str(settings_config.get('max_text_width_ratio', 0.85)))
+            self.image_corner_radius_entry.delete(0, 'end');
+            self.image_corner_radius_entry.insert(0, str(settings_config.get('corner_radius', 15)))
+            self.image_text_padding_entry.delete(0, 'end');
+            self.image_text_padding_entry.insert(0, str(settings_config.get('text_padding', 20)))
+            self.image_text_align_in_block_menu.set(settings_config.get('text_align_in_block', 'center'))
+
+            self.image_text_positions_textbox.delete("1.0", "end");
+            self.image_text_positions_textbox.insert("1.0",
+                                                     json.dumps(settings_config.get('text_positions', [[0.5, 0.5]]),
+                                                                indent=2))
+            self.image_line_spacing_options_textbox.delete("1.0", "end");
+            self.image_line_spacing_options_textbox.insert("1.0", ", ".join(
+                map(str, settings_config.get('line_spacing_options', [25]))))
+            self.image_zoom_crop_percentages_textbox.delete("1.0", "end");
+            self.image_zoom_crop_percentages_textbox.insert("1.0", ", ".join(
+                map(str, settings_config.get('zoom_crop_percentages', [0]))))
+
+            if settings_config.get('allow_random_horizontal_flip', True):
+                self.image_flip_switch.select()
+            else:
+                self.image_flip_switch.deselect()
+
+            self.log_image(f"ℹ️ 已加载预设 '{preset_name}'。")
+        except (FileNotFoundError, json.JSONDecodeError, AttributeError) as e:
+            self.log_image(f"❌ 加载预设失败: {e}")
+
+    def _image_delete_preset(self):
+        """删除当前选中的图片预设"""
+        preset_name = self.image_preset_menu.get()
+        if preset_name == "无预设":
+            tk_messagebox.showinfo("提示", "不能删除“无预设”选项。")
+            return
+        if not tk_messagebox.askyesno("确认删除", f"确定要永久删除预设 “{preset_name}” 吗？"):
+            return
+
+        try:
+            with open(self.IMAGE_PRESETS_FILE, 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+            if preset_name in presets:
+                del presets[preset_name]
+                with open(self.IMAGE_PRESETS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(presets, f, indent=4, ensure_ascii=False)
+                self.log_image(f"✅ 预设 ‘{preset_name}’ 已删除。")
+                self._image_populate_presets_dropdown()
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.log_image("❌ 删除失败: 预设文件不存在或已损坏。")
+
+    # 原有的 _video_save_preset 和 _video_load_preset 函数已失效，
+    # 但为防止其他地方调用，我们保留它们，但将其内容替换为提示信息。
+    # (实际上，上面的代码已经将所有调用都指向了新函数，所以这一步是可选的，但更安全)
+
+    def _video_save_preset_DEPRECATED(self):
+        """此函数已废弃，请使用增强版 _video_save_preset"""
+        self.log_video("错误: _video_save_preset_DEPRECATED 被调用，这是一个代码错误。")
+
+    def _video_load_preset_DEPRECATED(self, preset_name):
+        """此函数已废弃，请使用增强版 _video_load_preset"""
+        self.log_video("错误: _video_load_preset_DEPRECATED 被调用，这是一个代码错误。")
+
     def setup_image_settings_tab(self, tab):
         scrollable_frame = ctk.CTkScrollableFrame(tab, label_text="图片处理的所有参数均在此配置")
         scrollable_frame.pack(expand=True, fill="both", padx=5, pady=5)
@@ -9216,7 +9540,7 @@ class App(ctk.CTk):
         if hasattr(self, 'image_phone_serial_entry'): self._update_exclusive_entry_state(self.image_phone_serial_entry,
                                                                                          self.image_num_groups_entry)
         if hasattr(self, 'ab_phone_serial_entry'): self._update_exclusive_entry_state(self.ab_phone_serial_entry,
-                                                                                      self.ab_num_groups_entry)
+                                                                           self.ab_num_groups_entry)
     def _update_color_widget(self, attr_name, color_value): setattr(self, attr_name + "_value", color_value); button = getattr(self, attr_name + "_button"); button.configure(text=str(color_value), fg_color="gray" if "rgba" in str(color_value) else color_value)
 
 # ==============================================================================
