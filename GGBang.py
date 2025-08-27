@@ -4359,7 +4359,7 @@ class App(ctk.CTk):
         cv2.destroyAllWindows()
 
     def run_composite_logic(self):
-        """【新增单一模式】绿幕合成主逻辑 (集成了随机配对、随机混剪和单一模式)"""
+        """【修改版】绿幕合成主逻辑，增加了对背景文件夹结构和空组数的判断。"""
         temp_files_to_clean = []
         try:
             # 1. --- 获取所有UI配置 ---
@@ -4383,9 +4383,8 @@ class App(ctk.CTk):
             if not all([source_folder, bg_folder, output_folder]): self.log_composite(
                 "❌ 错误: 所有文件夹路径都必须选择！"); return
             source_videos = self._composite_get_video_files(source_folder)
-            background_videos = self._composite_get_video_files(bg_folder)
             if not source_videos: self.log_composite("❌ 错误: 绿幕文件夹中没有找到视频文件。"); return
-            if not background_videos: self.log_composite("❌ 错误: 背景文件夹中没有找到视频文件。"); return
+
             ffmpeg_path = self._find_executable("ffmpeg");
             ffprobe_path = self._find_executable("ffprobe")
             if not ffmpeg_path or not ffprobe_path: self.log_composite(
@@ -4393,11 +4392,14 @@ class App(ctk.CTk):
 
             # 3. --- 根据模式选择不同逻辑分支 ---
             if is_single_mode:
-                # --- [新功能] 单一模式逻辑 ---
+                # --- 单一模式逻辑 (保持不变) ---
+                background_videos = self._composite_get_video_files(bg_folder)
+                if not background_videos: self.log_composite("❌ 错误: 背景文件夹中没有找到视频文件。"); return
+
                 self.log_composite("▶️ 模式: 单一模式 (一个绿幕 vs 多个背景)")
                 if len(source_videos) != 1:
                     self.log_composite(
-                        f"❌ 错误: 单一模式要求绿幕文件夹中必须有且仅有 1 个视频文件，但找到了 {len(source_videos)} 个。")
+                        f"❌ 错误: 单一模式要求绿幕文件夹中必须有且仅有 1 个视频文件，但找到了 {len(source_videos)} 个。");
                     return
 
                 single_gs_video = source_videos[0]
@@ -4424,96 +4426,71 @@ class App(ctk.CTk):
                         use_gpu, use_gs_audio, do_freeze, freeze_duration
                     )
             else:
-                # --- 原始的多模式逻辑 ---
+                # --- 多模式逻辑 (已重构) ---
                 is_remix_mode = self.composite_remix_switch.get() == 1
                 num_groups_str = self.composite_num_groups_entry.get().strip()
                 phone_serials_str = self.composite_phone_serial_entry.get().strip()
                 group_names = []
+
+                # --- 【核心修改】处理组名逻辑 ---
                 if phone_serials_str:
                     group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
                     if not group_names: self.log_composite("错误: 手机序号输入无效。"); return
                 elif num_groups_str:
                     try:
-                        num_groups = int(num_groups_str);
-                        if num_groups <= 0: raise ValueError
-                        group_names = [f"group_{i + 1}" for i in range(num_groups)]
+                        num_groups = int(num_groups_str)
+                        if num_groups > 0:
+                            group_names = [f"group_{i + 1}" for i in range(num_groups)]
                     except (ValueError, TypeError):
-                        self.log_composite("错误: '生成组数' 必须是一个有效的正整数。");
-                        return
-                else:
-                    self.log_composite("错误: '生成组数' 或 '手机序号' 必须填写一个。");
-                    return
+                        pass  # 如果输入不是有效数字，则忽略，group_names 保持为空
 
-                self.log_composite(f"▶️ 模式: {'随机混剪 (拼接背景)' if is_remix_mode else '随机配对 (单个背景)'}")
-                self.log_composite(
-                    f"▶️ 将为 {len(source_videos)} 个绿幕视频，生成 {len(group_names)} 组，总计 {len(source_videos) * len(group_names)} 个结果视频。")
-                if is_remix_mode:
-                    self.log_composite("⚠️ 警告: 随机拼接模式已启用，处理成功后，用过的原始背景视频将被删除！")
+                # 如果两种方式都没有得到有效的组名，则进入直接输出模式
+                if not group_names:
+                    self.log_composite("▶️ 检测到组数为空，将直接输出到目标文件夹，不创建组文件夹。")
+                    group_names = [""]  # 使用一个空字符串作为“虚拟”组名来触发直接输出
 
-                total_tasks = len(source_videos) * len(group_names)
-                task_count = 0
+                # --- 检测背景文件夹结构 ---
+                bg_items = os.listdir(bg_folder)
+                bg_subfolders = [d for d in bg_items if os.path.isdir(os.path.join(bg_folder, d))]
 
-                for group_name in group_names:
-                    if self.composite_stop_event.is_set(): break
-                    group_output_folder = os.path.join(output_folder, group_name)
-                    os.makedirs(group_output_folder, exist_ok=True)
-                    self.log_composite(f"\n--- [开始处理组: {group_name}] ---")
+                if os.path.exists(output_folder): shutil.rmtree(output_folder)
+                os.makedirs(output_folder)
 
-                    for src_path in source_videos:
+                if bg_subfolders:
+                    # 【新逻辑】按子文件夹结构处理
+                    self.log_composite("▶️ 检测到背景文件夹包含子目录，将按目录结构进行处理。")
+                    for subfolder_name in bg_subfolders:
                         if self.composite_stop_event.is_set(): break
-                        task_count += 1
-                        self.log_composite(f"\n--- [总任务 {task_count}/{total_tasks}] ---")
-                        self.log_composite(f"  绿幕: {os.path.basename(src_path)}")
 
-                        bg_to_use = None;
-                        originals_to_delete_in_remix = []
-                        try:
-                            if is_remix_mode:
-                                if not background_videos:
-                                    self.log_composite(f"  -> ❌ 错误: 背景素材库已用尽，无法继续混剪，任务中止。")
-                                    self.composite_stop_event.set();
-                                    break
-                                cmd_probe_gs = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
-                                                "default=noprint_wrappers=1:nokey=1", os.path.normpath(src_path)]
-                                result = subprocess.run(cmd_probe_gs, check=True, capture_output=True, text=True)
-                                gs_duration = float(result.stdout.strip())
-                                if gs_duration <= 0: self.log_composite(f"  -> 警告: 绿幕视频时长为0，已跳过。"); continue
-                                bg_to_use, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_background(
-                                    background_videos, gs_duration, group_output_folder)
-                                temp_files_to_clean.extend(temp_files_from_remix)
-                                if not bg_to_use: self.log_composite(
-                                    f"  -> ❌ 错误: 无法创建混剪背景，跳过此任务。"); continue
-                            else:
-                                bg_to_use = random.choice(background_videos)
-                                self.log_composite(f"  -> 随机配对背景: {os.path.basename(bg_to_use)}")
+                        current_bg_path = os.path.join(bg_folder, subfolder_name)
+                        current_background_videos = self._composite_get_video_files(current_bg_path)
+                        if not current_background_videos:
+                            self.log_composite(f"  -> 警告: 背景子文件夹 '{subfolder_name}' 为空，已跳过。");
+                            continue
 
-                            src_basename = os.path.splitext(os.path.basename(src_path))[0]
-                            bg_basename = os.path.splitext(os.path.basename(bg_to_use))[0]
-                            output_filename = f"{src_basename}_on_{bg_basename}.mp4"
-                            output_filepath = os.path.join(group_output_folder, output_filename)
+                        current_output_path = os.path.join(output_folder, subfolder_name)
+                        os.makedirs(current_output_path, exist_ok=True)
 
-                            self._perform_single_composite(
-                                ffmpeg_path, ffprobe_path, bg_to_use, src_path, output_filepath,
-                                key_color, similarity, blend, despill_amount, quality_val,
-                                use_gpu, use_gs_audio, do_freeze, freeze_duration
-                            )
+                        self.log_composite(f"\n---=== 开始处理背景目录: {subfolder_name} ===---")
 
-                            if is_remix_mode:
-                                self.log_composite("  -> [混剪] 正在删除本次使用过的源背景视频...")
-                                for original_path in originals_to_delete_in_remix:
-                                    if original_path in background_videos:
-                                        try:
-                                            os.remove(original_path)
-                                            background_videos.remove(original_path)
-                                            self.log_composite(f"    -> 🗑️ 已删除: {os.path.basename(original_path)}")
-                                        except OSError as e:
-                                            self.log_composite(
-                                                f"    -> ❌ 删除源文件 {os.path.basename(original_path)} 失败: {e}")
-                        except Exception as e:
-                            self.log_composite(f"  ❌ 任务失败: {e}")
-                        finally:
-                            if is_remix_mode and bg_to_use and os.path.exists(bg_to_use):
-                                temp_files_to_clean.append(bg_to_use)
+                        self._run_composite_batch(
+                            source_videos, current_background_videos, current_output_path, group_names,
+                            is_remix_mode, ffmpeg_path, ffprobe_path, key_color, similarity,
+                            blend, despill_amount, quality_val, use_gpu, use_gs_audio,
+                            do_freeze, freeze_duration, temp_files_to_clean
+                        )
+                else:
+                    # 【原始逻辑】处理根目录下的所有视频
+                    self.log_composite("▶️ 检测到背景文件夹中为视频文件，将进行常规处理。")
+                    background_videos = self._composite_get_video_files(bg_folder)
+                    if not background_videos: self.log_composite("❌ 错误: 背景文件夹中没有找到视频文件。"); return
+
+                    self._run_composite_batch(
+                        source_videos, background_videos, output_folder, group_names,
+                        is_remix_mode, ffmpeg_path, ffprobe_path, key_color, similarity,
+                        blend, despill_amount, quality_val, use_gpu, use_gs_audio,
+                        do_freeze, freeze_duration, temp_files_to_clean
+                    )
 
             if self.composite_stop_event.is_set():
                 self.log_composite("🔴 任务已中止。")
@@ -4528,8 +4505,7 @@ class App(ctk.CTk):
             for f in temp_files_to_clean:
                 if f and os.path.exists(f):
                     try:
-                        os.remove(f);
-                        cleaned_count += 1
+                        os.remove(f); cleaned_count += 1
                     except OSError:
                         pass
             self.log_composite(f"--- 清理完毕 ({cleaned_count}个文件) ---")
@@ -6227,6 +6203,106 @@ class App(ctk.CTk):
         draw.multiline_text(position, wrapped_text, font=font, fill=font_color, align="center")
         return np.array(bg_image)
 
+    def _run_composite_batch(self, source_videos, background_videos, output_folder_base, group_names,
+                             is_remix_mode, ffmpeg_path, ffprobe_path, key_color, similarity,
+                             blend, despill_amount, quality_val, use_gpu, use_gs_audio,
+                             do_freeze, freeze_duration, temp_files_to_clean):
+        """
+        处理一批绿幕合成任务的辅助函数。
+        接收指定的绿幕视频、背景视频和输出路径，并执行循环处理。
+        """
+        self.log_composite(f"▶️ 模式: {'随机混剪 (拼接背景)' if is_remix_mode else '随机配对 (单个背景)'}")
+
+        # 根据 group_names 的内容调整日志信息
+        if group_names == [""]:
+            total_tasks = len(source_videos) * len(background_videos)
+            self.log_composite(
+                f"▶️ 将为 {len(source_videos)} 个绿幕视频，与每个背景视频配对，总计 {total_tasks} 个结果视频。")
+        else:
+            total_tasks = len(source_videos) * len(group_names)
+            self.log_composite(
+                f"▶️ 将为 {len(source_videos)} 个绿幕视频，生成 {len(group_names)} 组，总计 {total_tasks} 个结果视频。")
+
+        if is_remix_mode:
+            self.log_composite("⚠️ 警告: 随机拼接模式已启用，处理成功后，用过的原始背景视频将被删除！")
+
+        task_count = 0
+        local_background_videos = list(background_videos)
+
+        for group_name in group_names:
+            if self.composite_stop_event.is_set(): break
+
+            # 如果 group_name 为空字符串，输出路径就是基础路径；否则，在其下创建组文件夹
+            group_output_folder = os.path.join(output_folder_base, group_name)
+            os.makedirs(group_output_folder, exist_ok=True)
+
+            # 仅在有实际组名时打印分组日志
+            if group_name:
+                self.log_composite(f"\n--- [开始处理组: {group_name}] ---")
+
+            for src_path in source_videos:
+                if self.composite_stop_event.is_set(): break
+                task_count += 1
+                self.log_composite(f"\n--- [总任务 {task_count}/{total_tasks}] ---")
+                self.log_composite(f"  绿幕: {os.path.basename(src_path)}")
+
+                # 当不分组时，每个绿幕视频都会和所有背景视频配对
+                backgrounds_for_this_loop = local_background_videos if group_name == "" else [
+                    random.choice(local_background_videos)]
+
+                for bg_path in backgrounds_for_this_loop:
+                    bg_to_use = bg_path
+                    originals_to_delete_in_remix = []
+                    try:
+                        if is_remix_mode:
+                            # 混剪模式不适用于一对多匹配，这里保持原逻辑（为每个任务创建一个混剪背景）
+                            if not local_background_videos:
+                                self.log_composite(f"  -> ❌ 错误: 背景素材库已用尽，无法继续混剪，任务中止。")
+                                self.composite_stop_event.set();
+                                break
+                            cmd_probe_gs = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
+                                            "default=noprint_wrappers=1:nokey=1", os.path.normpath(src_path)]
+                            result = subprocess.run(cmd_probe_gs, check=True, capture_output=True, text=True)
+                            gs_duration = float(result.stdout.strip())
+                            if gs_duration <= 0: self.log_composite(f"  -> 警告: 绿幕视频时长为0，已跳过。"); continue
+                            bg_to_use, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_background(
+                                local_background_videos, gs_duration, group_output_folder)
+                            temp_files_to_clean.extend(temp_files_from_remix)
+                            if not bg_to_use: self.log_composite(f"  -> ❌ 错误: 无法创建混剪背景，跳过此任务。"); continue
+                        else:
+                            self.log_composite(f"  -> 配对背景: {os.path.basename(bg_to_use)}")
+
+                        src_basename = os.path.splitext(os.path.basename(src_path))[0]
+                        bg_basename = os.path.splitext(os.path.basename(bg_to_use))[0]
+                        output_filename = f"{src_basename}_on_{bg_basename}.mp4"
+                        output_filepath = os.path.join(group_output_folder, output_filename)
+
+                        self._perform_single_composite(
+                            ffmpeg_path, ffprobe_path, bg_to_use, src_path, output_filepath,
+                            key_color, similarity, blend, despill_amount, quality_val,
+                            use_gpu, use_gs_audio, do_freeze, freeze_duration
+                        )
+
+                        if is_remix_mode:
+                            self.log_composite("  -> [混剪] 正在删除本次使用过的源背景视频...")
+                            for original_path in originals_to_delete_in_remix:
+                                if original_path in local_background_videos:
+                                    try:
+                                        os.remove(original_path)
+                                        local_background_videos.remove(original_path)
+                                        self.log_composite(f"    -> 🗑️ 已删除: {os.path.basename(original_path)}")
+                                    except OSError as e:
+                                        self.log_composite(
+                                            f"    -> ❌ 删除源文件 {os.path.basename(original_path)} 失败: {e}")
+                    except Exception as e:
+                        self.log_composite(f"  ❌ 任务失败: {e}")
+                    finally:
+                        if is_remix_mode and bg_to_use and os.path.exists(bg_to_use):
+                            temp_files_to_clean.append(bg_to_use)
+
+                # 如果是混剪模式，在处理完一个绿幕视频后就跳出内层背景循环
+                if is_remix_mode:
+                    continue
     def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False,
                             gpu_codec='libx264', crop_duration=0, mirror_content=False, zoom_factor=1.0):
         """【终极修复版】使用内存管道技术，彻底解决中文路径问题"""
