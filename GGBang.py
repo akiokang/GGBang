@@ -3275,8 +3275,11 @@ class App(ctk.CTk):
                 widget.configure(state="disabled")
 
     def run_video_logic_hybrid(self):
+        """
+        【v2.1 重构版】修复混剪模式素材池过小的问题。
+        """
         try:
-            # --- 1. 获取所有UI输入和配置 ---
+            # --- 1. 获取所有UI输入和配置 (此部分不变) ---
             config = self.get_video_config_from_gui()
             if not config: self.after(0, self._reset_video_buttons); return
 
@@ -3284,7 +3287,6 @@ class App(ctk.CTk):
             output_folder = self.video_output_folder_entry.get()
             all_input_text = self.video_text_input_box.get("1.0", "end-1c")
             use_gpu = self.video_use_gpu_switch.get() == 1
-            is_remix_mode = self.video_random_remix_switch.get() == 1
 
             text_lines = [line.strip() for line in all_input_text.splitlines() if line.strip()]
             if not text_lines:
@@ -3293,12 +3295,14 @@ class App(ctk.CTk):
                 return
 
             durations_str = self.video_durations_entry.get()
-            # --- 新增逻辑：判断用户是否输入了时长 ---
-            is_duration_specified = bool(durations_str.strip())
+            duration_instructions = self._parse_duration_string(durations_str)
+            is_duration_specified = bool(duration_instructions)
 
-            durations_list = []
-            if is_duration_specified:
-                durations_list = [self._safe_float_convert(d, 0) for d in durations_str.split('.') if d.strip()]
+            if is_duration_specified and len(text_lines) != len(duration_instructions):
+                self.log_video(
+                    f"❌ 错误: 文案有 {len(text_lines)} 行，但时长指令有 {len(duration_instructions)} 段，两者数量必须完全一致！")
+                self.after(0, self._reset_video_buttons);
+                return
 
             all_original_videos = [os.path.join(video_folder, f) for f in os.listdir(video_folder) if
                                    f.lower().endswith(('.mp4', '.mov', '.avi'))]
@@ -3306,50 +3310,40 @@ class App(ctk.CTk):
                 self.log_video("错误: 视频文件夹中没有任何视频文件。");
                 return
 
-            # --- 2. 统一的模式判断与预检逻辑 ---
-            group_names = []
+            # --- 2. 预检与分组 (此部分不变) ---
+            group_names, num_groups = [], 0
             num_groups_str = self.video_num_groups_entry.get().strip()
             phone_serials_str = self.video_phone_serial_entry.get().strip()
             if phone_serials_str:
                 group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
                 if not group_names: self.log_video("错误: 手机序号输入无效。"); self.after(0,
                                                                                           self._reset_video_buttons); return
-                self.log_video(f"手机序号模式激活，将创建 {len(group_names)} 个指定名称的文件夹。")
+                num_groups = len(group_names)
             elif num_groups_str:
-                try:
-                    num_groups = self._safe_int_convert(num_groups_str, 0)
-                    if num_groups <= 0: raise ValueError
-                    group_names = [f"group_{i + 1}" for i in range(num_groups)]
-                    self.log_video(f"组数模式激活，将创建 {len(group_names)} 个文件夹。")
-                except ValueError:
-                    self.log_video("错误: '生成组数' 必须是一个有效的正整数。");
-                    self.after(0, self._reset_video_buttons);
-                    return
+                num_groups = self._safe_int_convert(num_groups_str, 0)
+                if num_groups <= 0: self.log_video("错误: '生成组数' 必须是一个有效的正整数。"); self.after(0,
+                                                                                                           self._reset_video_buttons); return
+                group_names = [f"group_{i + 1}" for i in range(num_groups)]
             else:
                 self.log_video("错误: '生成组数' 或 '手机序号' 必须填写一个。");
                 self.after(0, self._reset_video_buttons);
                 return
 
-            # --- 修改后的视频数量检查逻辑 ---
-            # 如果不是“按时长混剪”模式 (即 顺序模式 或 时长为空的混剪模式)，则需要严格检查视频数量
-            if not (is_remix_mode and is_duration_specified):
-                total_videos_needed = len(group_names) * len(text_lines)
-                if len(all_original_videos) < total_videos_needed:
-                    self.log_video(
-                        f"错误: 视频不足！当前模式需要 {total_videos_needed} 个视频, 但只有 {len(all_original_videos)} 个。");
-                    self.after(0, self._reset_video_buttons);
-                    return
+            total_videos_needed = len(text_lines) * num_groups
+            if len(all_original_videos) < total_videos_needed:
+                self.log_video(
+                    f"错误: 视频素材不足！需要 {total_videos_needed} 个视频, 但只有 {len(all_original_videos)} 个。");
+                return
 
             if os.path.exists(output_folder): shutil.rmtree(output_folder)
             os.makedirs(output_folder)
 
             random.shuffle(all_original_videos)
-            video_pool = list(all_original_videos)
+            video_pool = list(all_original_videos)  # Master video pool
 
-            # --- 3. 统一的主处理循环 ---
+            # --- 3. 主处理循环 (核心修改点) ---
             for idx, group_name in enumerate(group_names):
                 if self.video_stop_event.is_set(): break
-
                 group_folder = os.path.join(output_folder, group_name)
                 os.makedirs(group_folder, exist_ok=True)
                 self.log_video(f"\n---=== 开始处理组: {group_name} ===---")
@@ -3357,87 +3351,35 @@ class App(ctk.CTk):
                 for j, text_line in enumerate(text_lines):
                     if self.video_stop_event.is_set(): break
 
-                    input_video_path = None
-                    temp_files_for_this_task = []
-                    is_current_task_remix_clip = False  # 用于区分是“混剪片段”还是“单个视频”
-                    originals_to_delete_in_remix = []
+                    if not video_pool:
+                        self.log_video(f"  ❌ 错误: 视频池已空，无法继续处理任务。任务中止。")
+                        self.video_stop_event.set();
+                        break
+
+                    duration_instruction = duration_instructions[j] if is_duration_specified else None
+                    output_name = f"{group_name}_{j + 1}.mp4"
 
                     try:
-                        if is_remix_mode:
-                            # --- 新逻辑分支：根据是否输入时长来决定行为 ---
-                            if is_duration_specified:
-                                # --- 行为1: 用户输入了时长，执行原有的混剪逻辑 ---
-                                self.log_video(f"  -> [模式] 按时长混剪")
-                                if j >= len(durations_list):
-                                    self.log_video(f"  -> 警告: 时长列表数量不足，跳过文案 '{text_line[:10]}...'")
-                                    continue
-                                target_duration = durations_list[j]
-                                input_video_path, temp_files_from_remix, originals_to_delete_in_remix = self._create_random_remix_clip(
-                                    target_duration, video_pool, group_folder, self.log_video)
-                                if not input_video_path:
-                                    self.log_video(f"  ❌ 错误: 为文案 '{text_line[:10]}...' 创建混剪视频失败，跳过。")
-                                    continue
-                                temp_files_for_this_task.extend(temp_files_from_remix)
-                                temp_files_for_this_task.append(input_video_path)
-                                is_current_task_remix_clip = True
-                                duration_param = ""  # 时长已在混剪时处理完毕
-                            else:
-                                # --- 行为2: 用户未输入时长，执行新的“一文案一视频”逻辑 ---
-                                self.log_video(f"  -> [模式] 时长为空，随机抽取完整视频")
-                                if not video_pool:
-                                    self.log_video(f"  ❌ 错误: 视频池已空，无法为文案 '{text_line[:10]}...' 分配视频。")
-                                    continue
+                        # 【修改】不再传递单个视频，而是传递整个视频池
+                        success, used_originals = self._apply_text_and_remix_worker(
+                            video_pool, group_folder, output_name, text_line, config, use_gpu, duration_instruction
+                        )
 
-                                # 从视频池中随机抽取一个视频，并移除，防止重复使用
-                                input_video_path = video_pool.pop(random.randrange(len(video_pool)))
-                                duration_param = ""  # 使用完整时长
-                                is_current_task_remix_clip = False
-                        else:
-                            # --- 行为3: 顺序模式（非混剪）---
-                            self.log_video(f"  -> [模式] 顺序处理")
-                            video_index = idx * len(text_lines) + j
-                            if video_index >= len(video_pool):
-                                self.log_video(f"  ❌ 错误: 视频池中视频不足，任务中止。")
-                                self.video_stop_event.set();
-                                break
-                            input_video_path = video_pool[video_index]
-                            is_current_task_remix_clip = False
-                            # 为顺序模式设置时长参数
-                            duration_param = ""
-                            if durations_list:
-                                current_duration = durations_list[j % len(durations_list)]
-                                if current_duration > 0:
-                                    duration_param = f"-to {current_duration}"
-                                    self.log_video(f"  -> 将应用时长: {current_duration}s")
+                        # 【修改】任务结束后，从主视频池中移除并删除已用过的视频
+                        if success and used_originals:
+                            for original_path in used_originals:
+                                if original_path in video_pool:
+                                    video_pool.remove(original_path)
 
-                        # 统一调用处理函数
-                        output_name = f"{group_name}_{j + 1}.mp4"
-                        self._apply_text_to_video(input_video_path, group_folder, output_name, text_line, config,
-                                                  use_gpu, duration_param, temp_files_for_this_task)
-
-                    except Exception as e:
-                        self.log_video(
-                            f"  -> ❌ 处理视频 {os.path.basename(input_video_path or '未知')} 时发生致命错误: {e}")
-
-                    else:
-                        # --- 修改后的删除逻辑 ---
-                        if is_current_task_remix_clip:
-                            # 如果是“按时长混剪”出的片段，则删除用过的原始视频
-                            self.log_video(f"  -> [混剪] 正在删除本次混剪使用过的源视频...")
-                            for original_path in originals_to_delete_in_remix:
                                 if os.path.exists(original_path):
                                     try:
-                                        os.remove(original_path); self.log_video(
-                                            f"    -> ✅ 已删除: {os.path.basename(original_path)}")
+                                        os.remove(original_path)
+                                        self.log_video(f"  -> ✅ 源视频已删除: {os.path.basename(original_path)}")
                                     except OSError as e:
-                                        self.log_video(f"    -> ❌ 删除失败: {e}")
-                        elif input_video_path and os.path.exists(input_video_path):
-                            # 如果是“顺序模式”或“时长为空的混剪模式”，则直接删除用掉的那个视频
-                            try:
-                                os.remove(input_video_path)
-                                self.log_video(f"  -> ✅ 源视频已删除: {os.path.basename(input_video_path)}")
-                            except OSError as e:
-                                self.log_video(f"  -> ❌ 删除源视频时发生异常: {e}")
+                                        self.log_video(f"  -> ❌ 删除源视频时发生异常: {e}")
+                    except Exception as e:
+                        self.log_video(f"  -> ❌ 处理任务时发生致命错误: {e}")
+                        traceback.print_exc()
 
             if not self.video_stop_event.is_set():
                 self.log_video("\n---=== 所有任务处理完毕！ ===---")
@@ -3446,6 +3388,113 @@ class App(ctk.CTk):
             traceback.print_exc()
         finally:
             self.after(0, self._reset_video_buttons)
+
+    def _apply_text_and_remix_worker(self, video_pool, group_folder, video_name, text_line, config, use_gpu,
+                                     duration_instruction):
+        """
+        【v2.3 修正版】修复了复杂模式下最终视频时长不精确的问题。
+        """
+        temp_files_to_delete = []
+        original_videos_used = []
+        base_video_path = None
+
+        try:
+            # --- 步骤 1: 准备基础视频 (逻辑不变) ---
+            if isinstance(duration_instruction, dict):
+                self.log_video(f"\n- 正在创建混剪视频 (目标总长: {duration_instruction['total']:.2f}s)")
+                remix_video_path, temp_remix_files, used_originals_in_remix = self._create_random_remix_clip(
+                    duration_instruction['total'], video_pool, group_folder, self.log_video
+                )
+                if not remix_video_path: raise RuntimeError("创建混剪视频失败。")
+                base_video_path = remix_video_path
+                temp_files_to_delete.extend(temp_remix_files)
+                original_videos_used.extend(used_originals_in_remix)
+            else:
+                base_video_path = video_pool[0]
+                original_videos_used.append(base_video_path)
+                self.log_video(f"\n- 正在处理: {os.path.basename(base_video_path)}")
+
+            # --- 步骤 2: 预处理 (逻辑不变) ---
+            corrected_video_path, temp_orientation_file = self._preprocess_video_orientation(base_video_path,
+                                                                                             group_folder,
+                                                                                             self.log_video)
+            if temp_orientation_file: temp_files_to_delete.append(temp_orientation_file)
+            if not corrected_video_path: raise RuntimeError("视频预处理失败。")
+
+            # --- 步骤 3: 生成PNG叠加层 (逻辑不变) ---
+            overlay_pngs_info = []
+            if isinstance(duration_instruction, dict):
+                sub_texts, duration_parts, current_time = text_line.split('-'), duration_instruction['parts'], 0
+                if len(sub_texts) != len(duration_parts): self.log_video(
+                    f"  -> 警告: 复杂时长有 {len(duration_parts)} 段，但文案只有 {len(sub_texts)} 段。将只处理匹配的部分。")
+                for i, sub_text in enumerate(sub_texts):
+                    if i >= len(duration_parts): break
+                    duration, start_time, end_time = duration_parts[i], current_time, current_time + duration_parts[i]
+                    self.log_video(
+                        f"  -> 生成文案片段 '{sub_text.strip()[:15]}...' (显示时间: {start_time:.2f}s - {end_time:.2f}s)")
+                    overlay_pil_image = self._create_overlay_as_pillow_image(sub_text.strip(), config['共享样式'],
+                                                                             config, (1080, 1920))
+                    png_path = os.path.join(group_folder, f"overlay_{i}_{random.randint(1000, 9999)}.png")
+                    overlay_pil_image.save(png_path, 'PNG')
+                    overlay_pngs_info.append({'path': png_path, 'start': start_time, 'end': end_time})
+                    current_time += duration
+            else:
+                self.log_video("  -> [模式] 简单时长，生成单个文案层")
+                overlay_pil_image = self._create_overlay_as_pillow_image(text_line, config['共享样式'], config,
+                                                                         (1080, 1920))
+                png_path = os.path.join(group_folder, f"overlay_main_{random.randint(1000, 9999)}.png")
+                overlay_pil_image.save(png_path, 'PNG')
+                overlay_pngs_info.append({'path': png_path, 'start': None, 'end': None})
+
+            # --- 步骤 4: 构建并执行最终的FFmpeg命令 (核心修正点) ---
+            output_video_path = os.path.join(group_folder, f"processed_{os.path.splitext(video_name)[0]}.mp4")
+            safe_ffmpeg_path = f'"{os.path.normpath(self._find_executable("ffmpeg"))}"'
+            safe_corrected_video_path = f'"{os.path.normpath(corrected_video_path)}"'
+            safe_output_path = f'"{os.path.normpath(output_video_path)}"'
+            ffmpeg_inputs = [f'-i {safe_corrected_video_path}']
+            for info in overlay_pngs_info: ffmpeg_inputs.append(f'-i "{os.path.normpath(info["path"])}"')
+            filter_chains, last_stream = [], "[0:v]"
+            for k, info in enumerate(overlay_pngs_info):
+                input_stream, output_tag = f"[{k + 1}:v]", "[v_out]" if k == len(
+                    overlay_pngs_info) - 1 else f"[v{k + 1}]"
+                pos_config = config['主文案']['位置']
+                x_pos_val, y_pos_val = pos_config['水平位置 (x)'], pos_config['垂直位置 (y)']
+                x_pos = "(W-w)/2" if str(x_pos_val) == 'center' else str(x_pos_val)
+                time_filter = f":enable='between(t,{info['start']},{info['end']})'" if info['start'] is not None else ""
+                filter_chains.append(f"{last_stream}{input_stream}overlay={x_pos}:{y_pos_val}{time_filter}{output_tag}")
+                last_stream = output_tag
+            filter_complex_string = ";".join(filter_chains)
+
+            # 【关键修正】确保最终命令也包含总时长限制
+            duration_param = ""
+            if isinstance(duration_instruction, (int, float)) and duration_instruction > 0:
+                duration_param = f"-to {duration_instruction}"
+            elif isinstance(duration_instruction, dict):
+                duration_param = f"-to {duration_instruction['total']}"  # <-- 新增这行逻辑
+
+            output_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
+            command_string = (
+                f'{safe_ffmpeg_path} -y {" ".join(ffmpeg_inputs)} {duration_param} -filter_complex "{filter_complex_string}" '
+                f'-map "[v_out]" -map 0:a? -c:v {output_codec} -preset fast -pix_fmt yuv420p '
+                f'-c:a aac -b:a 192k -movflags +faststart {safe_output_path}')
+            self.log_video(f"  -> 步骤2: 使用FFmpeg高速合成...");
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True, encoding='utf-8',
+                           errors='ignore', creationflags=creation_flags)
+            self.log_video(f"  -> 成功! 输出文件: {os.path.basename(output_video_path)}")
+            return True, list(set(original_videos_used))
+        except Exception as e:
+            self.log_video(f"  -> 错误: {e}")
+            return False, list(set(original_videos_used))
+        finally:
+            files_to_clean = temp_files_to_delete + [item['path'] for item in overlay_pngs_info]
+            for f in files_to_clean:
+                if f and os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
     def _apply_text_to_video(self, input_video_path, group_folder, video_name, text_line, config, use_gpu,
                              duration_param, temp_files_to_delete):
         """【最终修正版】将原有的单个视频处理逻辑封装起来，并修复所有已知错误"""
@@ -4584,6 +4633,37 @@ class App(ctk.CTk):
         except subprocess.CalledProcessError as e:
             self.log_composite(f"  ❌ FFmpeg 处理失败:\n{e.stderr.strip()}")
 
+    def _parse_duration_string(self, durations_str):
+        """
+        【新增】解析新的、支持'-'拼接的时长字符串。
+        返回一个指令列表，例如：[6.0, {'total': 14.0, 'parts': [5.0, 5.0, 4.0]}]
+        """
+        instructions = []
+        if not durations_str.strip():
+            return instructions
+
+        parts = durations_str.strip().split('.')
+        for part in parts:
+            part = part.strip()
+            if not part: continue
+
+            if '-' in part:
+                # 复杂模式，例如 "5-5-4"
+                sub_parts_str = part.split('-')
+                sub_durations = [self._safe_float_convert(p, 0) for p in sub_parts_str]
+                # 过滤掉任何无效的 (小于等于0) 的时长
+                sub_durations = [d for d in sub_durations if d > 0]
+                if sub_durations:
+                    instructions.append({
+                        'total': sum(sub_durations),
+                        'parts': sub_durations
+                    })
+            else:
+                # 简单模式，例如 "6"
+                duration = self._safe_float_convert(part, 0)
+                if duration > 0:
+                    instructions.append(duration)
+        return instructions
     # ==============================================================================
     # --- 加滤镜 (新功能) ---
     # ==============================================================================
@@ -7075,8 +7155,9 @@ class App(ctk.CTk):
         self.start_video_button = ctk.CTkButton(button_frame, text="开始处理视频", height=40, command=self.start_video_processing_hybrid); self.start_video_button.grid(row=0, column=0, padx=(0,5), sticky="ew")
         self.stop_video_button = ctk.CTkButton(button_frame, text="停止处理", height=40, command=self.stop_video_processing, state="disabled", fg_color="red", hover_color="darkred"); self.stop_video_button.grid(row=0, column=1, padx=(5,0), sticky="ew")
         self.video_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9"); self.video_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
+
     def _create_random_remix_clip(self, target_duration, available_videos, temp_dir, logger):
-        """【最终版 - FFmpeg核心 - 即时修正MOV】根据目标时长，随机抽取、修正并拼接视频片段"""
+        """【v2.1 修正版】修复了临时混剪视频未被清理的问题"""
         logger(f"  -> [混剪] 目标时长: {target_duration:.2f}s。开始构建FFmpeg混剪任务...")
 
         ffmpeg_path = self._find_executable("ffmpeg")
@@ -7086,13 +7167,12 @@ class App(ctk.CTk):
             return None, [], []
 
         creation_flags = 0
-        if sys.platform == 'win32':
-            creation_flags = subprocess.CREATE_NO_WINDOW
+        if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
 
         concat_list_path = os.path.join(temp_dir, f"concat_list_{random.randint(1000, 9999)}.txt")
         clips_info = []
-        temp_files_created_this_run = []
-        original_videos_used = []  # 新增：用于追踪本次混剪使用过的原始视频
+        temp_files_created_this_run = [concat_list_path]  # 列表文件本身也需要清理
+        original_videos_used = []
         current_duration = 0
         video_pool = list(available_videos)
 
@@ -7101,37 +7181,25 @@ class App(ctk.CTk):
                 if not video_pool:
                     logger("    -> [警告] 所有可用视频都已尝试过，无法继续拼接。")
                     break
-
                 original_video_path = random.choice(video_pool)
-
                 try:
-                    # --- 核心修复：在这里对每一个选中的视频进行“即时”预处理 ---
                     corrected_path, temp_file = self._preprocess_video_orientation(original_video_path, temp_dir,
                                                                                    logger)
-
                     if not corrected_path:
-                        logger(
-                            f"    -> [警告] 预处理视频 {os.path.basename(original_video_path)} 失败，将从视频池中移除。")
-                        video_pool.remove(original_video_path)
+                        video_pool.remove(original_video_path);
                         continue
-
-                    if temp_file:
-                        temp_files_created_this_run.append(temp_file)
+                    if temp_file: temp_files_created_this_run.append(temp_file)
 
                     cmd_probe = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
                                  "default=noprint_wrappers=1:nokey=1", os.path.normpath(corrected_path)]
                     result = subprocess.run(cmd_probe, check=True, capture_output=True, text=True,
                                             creationflags=creation_flags)
                     clip_duration = float(result.stdout.strip())
-
                     if clip_duration <= 0: raise ValueError("视频时长为0或无效")
 
-                    # 新增：如果视频被成功选用，就将其原始路径加入待删除列表
-                    if original_video_path not in original_videos_used:
-                        original_videos_used.append(original_video_path)
+                    if original_video_path not in original_videos_used: original_videos_used.append(original_video_path)
 
                     remaining_needed = target_duration - current_duration
-
                     if clip_duration >= remaining_needed:
                         clips_info.append({'path': corrected_path, 'duration': remaining_needed})
                         logger(
@@ -7143,44 +7211,40 @@ class App(ctk.CTk):
                         logger(f"    -> 添加片段: {os.path.basename(original_video_path)} (完整 {clip_duration:.2f}s)")
                         current_duration += clip_duration
                         video_pool.remove(original_video_path)
-
                 except Exception as e:
                     logger(
                         f"    -> [警告] 加载或处理视频 {os.path.basename(original_video_path)} 失败: {e}，将从视频池中移除。")
-                    if original_video_path in video_pool:
-                        video_pool.remove(original_video_path)
+                    if original_video_path in video_pool: video_pool.remove(original_video_path)
                     continue
 
             if not clips_info:
                 logger("  -> [错误] 未能收集到任何有效的视频片段用于混剪。")
                 return None, temp_files_created_this_run, []
-
             with open(concat_list_path, 'w', encoding='utf-8') as f:
                 for info in clips_info:
                     safe_path = os.path.normpath(info['path']).replace('\\', '/')
                     f.write(f"file '{safe_path}'\n")
-                    if info['duration'] is not None:
-                        f.write(f"outpoint {info['duration']:.3f}\n")
+                    if info['duration'] is not None: f.write(f"outpoint {info['duration']:.3f}\n")
 
             temp_output_path = os.path.join(temp_dir, f"remix_{random.randint(1000, 9999)}.mp4")
-            command = [
-                ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
-                '-i', concat_list_path,
-                '-c:v', 'libx264', '-preset', 'ultrafast', '-an',
-                os.path.normpath(temp_output_path)
-            ]
 
+            # 【关键修正】将生成的临时混剪视频本身也加入待删除列表
+            temp_files_created_this_run.append(temp_output_path)
+
+            command = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy',
+                       os.path.normpath(temp_output_path)]
             self.log_video(f"  -> [混剪] 正在调用FFmpeg核心进行高速拼接...")
             subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
                            creationflags=creation_flags)
             self.log_video(f"  -> [混剪] 成功生成临时混剪视频。")
-            return temp_output_path, temp_files_created_this_run, original_videos_used
 
+            return temp_output_path, temp_files_created_this_run, original_videos_used
         except subprocess.CalledProcessError as e:
             self.log_video(f"  ❌ FFmpeg 拼接失败:\n{e.stderr.strip()}")
             return None, temp_files_created_this_run, []
         finally:
-            if os.path.exists(concat_list_path): os.remove(concat_list_path)
+            # concat_list_path 已在 temp_files_created_this_run 中，会被统一清理，无需在此处单独删除
+            pass
 
     # 请用这个版本完整替换你的 setup_image_main_tab 函数
     def setup_image_main_tab(self, tab):
@@ -9039,21 +9103,81 @@ class App(ctk.CTk):
             self.log_image(f"图片配置错误: {e}")
             return None
 
-
-
-
-
-    def _create_overlay_as_pillow_image(self, text, shared_style, specific_config, video_size):
+    def _create_overlay_as_pillow_image(self, text_line, shared_style, all_specific_configs, video_size):
         """
-        【v6.0 总调度函数】根据UI开关的状态，选择使用“逐行背景”或“整体背景”模式。
+        【v7.0 最终版 - 文本合成器】
+        根据 '&' 分割文案，分别渲染主/次文案块，然后将它们垂直合成为一张图。
+        同时，根据UI开关决定每个文案块是采用“整体背景”还是“逐行背景”模式。
         """
-        # 检查新添加的开关状态
-        if self.video_line_by_line_bg_switch.get() == 1:
-            # 开关打开，调用逐行处理函数
-            return self._create_overlay_line_by_line(text, shared_style, specific_config, video_size)
-        else:
-            # 开关关闭，调用原始的整体处理函数
-            return self._create_overlay_block_style(text, shared_style, specific_config, video_size)
+        # 1. 分割主次文案
+        text_parts = text_line.split('&')
+        main_text = text_parts[0].strip()
+        sub_texts = [part.strip() for part in text_parts[1:]]
+
+        # 2. 获取对应的配置
+        main_config = all_specific_configs['主文案']
+        sub_configs_list = all_specific_configs.get('次文案', [])
+
+        # 3. 定义一个内部渲染函数，它会根据UI开关选择渲染模式
+        def render_text_block(text, specific_part_config):
+            if self.video_line_by_line_bg_switch.get() == 1:
+                return self._create_overlay_line_by_line(text, shared_style, specific_part_config, video_size)
+            else:
+                return self._create_overlay_block_style(text, shared_style, specific_part_config, video_size)
+
+        # 4. 渲染主文案部分
+        main_overlay_img = render_text_block(main_text, main_config)
+
+        # 5. 如果没有次文案，直接返回主文案的图像
+        if not sub_texts:
+            return main_overlay_img
+
+        # 6. 渲染所有次文案部分
+        sub_overlay_items = []
+        for i, sub_text in enumerate(sub_texts):
+            if i < len(sub_configs_list):
+                sub_config = sub_configs_list[i]
+                sub_img = render_text_block(sub_text, sub_config)
+                sub_overlay_items.append({'image': sub_img, 'config': sub_config})
+
+        # 7. 如果没有成功渲染出任何次文案，也直接返回主文案
+        if not sub_overlay_items:
+            return main_overlay_img
+
+        # 8. 合成所有部分
+        # 计算最终合成画布的总尺寸
+        total_width = main_overlay_img.width
+        total_height = main_overlay_img.height
+
+        for item in sub_overlay_items:
+            total_width = max(total_width, item['image'].width)
+            total_height += item['config']['相对Y轴偏移'] + item['image'].height
+
+        # 创建一个足够大的透明画布
+        canvas = Image.new("RGBA", (total_width, int(total_height)), (0, 0, 0, 0))
+
+        # 将主文案图片粘贴到画布顶部（水平居中）
+        main_x = (total_width - main_overlay_img.width) // 2
+        canvas.paste(main_overlay_img, (main_x, 0), main_overlay_img)  # 使用alpha通道粘贴
+
+        # 依次粘贴所有次文案图片
+        current_y = float(main_overlay_img.height)
+        for item in sub_overlay_items:
+            sub_img = item['image']
+            sub_config = item['config']
+
+            # 加上相对偏移量
+            current_y += sub_config['相对Y轴偏移']
+
+            # 计算次文案的水平居中位置
+            sub_x = (total_width - sub_img.width) // 2
+
+            canvas.paste(sub_img, (sub_x, int(current_y)), sub_img)  # 使用alpha通道粘贴
+
+            # 更新Y坐标，为下一个次文案做准备
+            current_y += sub_img.height
+
+        return canvas
 
     def _create_overlay_block_style(self, text, shared_style, specific_config, video_size):
         """
