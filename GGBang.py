@@ -396,7 +396,7 @@ class App(ctk.CTk):
         self.device_queue = queue.Queue()
         self.splitter_stop_event = threading.Event()
         self.uniform_resolution_stop_event = threading.Event()
-        self.avatar_stop_event = threading.Event()
+        self.feather_join_stop_event = threading.Event()
         self.porter_stop_event = threading.Event()
         self.img_to_video_stop_event = threading.Event()
         self.split_screen_stop_event = threading.Event()
@@ -469,15 +469,13 @@ class App(ctk.CTk):
         ai_sub_tabview.pack(expand=True, fill="both", padx=5, pady=5)
 
         # 3. 添加所有需要的子标签页
-
-        ai_sub_tabview.add("AI女巫")
+        ai_sub_tabview.add("羽化拼接") # <-- 修改点
         ai_sub_tabview.add("音频提取")
         ai_sub_tabview.add("视频克隆")
+        ai_sub_tabview.add("视频分屏")
 
         # 4. 调用各个子功能的设置函数，并把对应的子标签页传递给它们
-
-        self.setup_avatar_workflow(ai_sub_tabview.tab("AI女巫"))
-        ai_sub_tabview.add("视频分屏")  # <--
+        self.setup_feather_join_workflow(ai_sub_tabview.tab("羽化拼接")) # <-- 修改点
         self.setup_audio_extraction_workflow(ai_sub_tabview.tab("音频提取"))
         self.setup_video_clone_workflow(ai_sub_tabview.tab("视频克隆"))
         self.setup_split_screen_workflow(ai_sub_tabview.tab("视频分屏"))
@@ -1943,76 +1941,7 @@ class App(ctk.CTk):
     # ==============================================================================
     # --- 【新增功能】AI女巫 (大头照) ---
     # ==============================================================================
-    def setup_avatar_workflow(self, parent_tab):
-        """创建“AI女巫”功能的UI界面"""
-        tab = parent_tab
-        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
 
-        ctk.CTkLabel(main_frame, text="功能说明：自动识别人脸，并将头部区域放大为特写，制作大头照风格视频。",
-                     wraplength=800, justify="left").pack(anchor="w", padx=10, pady=(5, 10))
-
-        path_frame = ctk.CTkFrame(main_frame)
-        path_frame.pack(fill="x", pady=5)
-        ctk.CTkLabel(path_frame, text="1. 设置路径", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                                                           pady=(5, 10))
-        self.create_folder_selection_row(path_frame, "视频文件夹:", "选择包含人物视频的文件夹 (可含子文件夹)",
-                                         "avatar_input_folder_entry")
-        self.create_folder_selection_row(path_frame, "输出文件夹:", "选择处理后视频的存放位置",
-                                         "avatar_output_folder_entry")
-
-        params_frame = ctk.CTkFrame(main_frame)
-        params_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(params_frame, text="2. 效果配置", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
-                                                                                             pady=(5, 0))
-
-        effects_frame = ctk.CTkFrame(params_frame, fg_color="transparent")
-        effects_frame.pack(fill="x", padx=10, pady=5)
-        effects_frame.grid_columnconfigure((1, 3), weight=1)
-
-        ctk.CTkLabel(effects_frame, text="画面缩放系数:").grid(row=0, column=0, sticky="w", padx=(0, 10))
-        self.avatar_zoom_entry = ctk.CTkEntry(effects_frame, placeholder_text="数值越小,脸越大")
-        self.avatar_zoom_entry.insert(0, "2.0")
-        self.avatar_zoom_entry.grid(row=0, column=1, sticky="ew")
-
-        ctk.CTkLabel(effects_frame, text="对比度:").grid(row=0, column=2, sticky="w", padx=(20, 10))
-        self.avatar_contrast_entry = ctk.CTkEntry(effects_frame)
-        self.avatar_contrast_entry.insert(0, "1.0")
-        self.avatar_contrast_entry.grid(row=0, column=3, sticky="ew")
-
-        ctk.CTkLabel(effects_frame, text="亮度:").grid(row=1, column=0, sticky="w", pady=(10, 0), padx=(0, 10))
-        self.avatar_brightness_entry = ctk.CTkEntry(effects_frame)
-        self.avatar_brightness_entry.insert(0, "0.0")
-        self.avatar_brightness_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-
-        ctk.CTkLabel(effects_frame, text="饱和度:").grid(row=1, column=2, sticky="w", pady=(10, 0), padx=(20, 10))
-        self.avatar_saturation_entry = ctk.CTkEntry(effects_frame)
-        self.avatar_saturation_entry.insert(0, "1.0")
-        self.avatar_saturation_entry.grid(row=1, column=3, sticky="ew", pady=(10, 0))
-
-        self.avatar_mirror_switch = ctk.CTkSwitch(effects_frame, text="启用画面镜像 (水平翻转)")
-        self.avatar_mirror_switch.grid(row=2, column=0, columnspan=2, pady=(15, 0), sticky="w")
-
-        # --- 核心修改：增加GPU加速开关 ---
-        self.avatar_use_gpu_switch = ctk.CTkSwitch(effects_frame, text="启用GPU加速编码 (NVIDIA)")
-        self.avatar_use_gpu_switch.grid(row=2, column=2, columnspan=2, pady=(15, 0), sticky="w")
-
-        # --- 修改结束 ---
-
-        run_frame = ctk.CTkFrame(main_frame)
-        run_frame.pack(fill="x", padx=10, pady=(10, 5))
-        button_frame = ctk.CTkFrame(run_frame, fg_color="transparent")
-        button_frame.pack(fill="x", pady=10)
-        button_frame.grid_columnconfigure((0, 1), weight=1)
-        self.avatar_start_button = ctk.CTkButton(button_frame, text="开始批量生成大头照", height=40,
-                                                 command=self.start_avatar_processing)
-        self.avatar_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
-        self.avatar_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
-                                                command=self.stop_avatar_processing, state="disabled",
-                                                fg_color="red", hover_color="darkred")
-        self.avatar_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
-        self.avatar_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
-        self.avatar_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
 
     def log_avatar(self, message, clear=False):
         self.after(0, self._update_log, self.avatar_log_textbox, message, clear)
@@ -2162,61 +2091,290 @@ class App(ctk.CTk):
         finally:
             if cap: cap.release()
             self.active_ffmpeg_process = None
-    def run_avatar_logic(self):
+
+    # ==============================================================================
+    # --- 【新增功能】羽化拼接 ---
+    # ==============================================================================
+    def setup_feather_join_workflow(self, parent_tab):
+        """创建“羽化拼接”功能的UI界面"""
+        tab = parent_tab
+        main_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        main_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        ctk.CTkLabel(main_frame,
+                     text="功能说明：将A文件夹视频与B文件夹视频进行上下羽化拼接。\n程序会自动匹配B文件夹视频，使其总时长不小于A视频。",
+                     wraplength=800, justify="left").pack(anchor="w", padx=10, pady=(5, 10))
+
+        path_frame = ctk.CTkFrame(main_frame)
+        path_frame.pack(fill="x", pady=5)
+        ctk.CTkLabel(path_frame, text="1. 设置路径", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
+                                                                                           pady=(5, 10))
+        self.create_folder_selection_row(path_frame, "A文件夹 (主视频):", "选择文件夹A", "fj_folder_a_entry")
+        self.create_folder_selection_row(path_frame, "B文件夹 (素材视频):", "选择文件夹B", "fj_folder_b_entry")
+        self.create_folder_selection_row(path_frame, "输出文件夹:", "选择处理结果的存放位置",
+                                         "fj_output_folder_entry")
+
+        params_frame = ctk.CTkFrame(main_frame)
+        params_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(params_frame, text="2. 效果配置", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10,
+                                                                                             pady=(5, 0))
+        self.create_widget_row(params_frame, "羽化边距 (像素):", "fj_margin", "100",
+                               placeholder="数值越大，过渡区域越宽").pack(fill="x", padx=10, pady=5)
+
+        run_frame = ctk.CTkFrame(main_frame)
+        run_frame.pack(fill="x", padx=10, pady=(10, 5))
+        button_frame = ctk.CTkFrame(run_frame, fg_color="transparent")
+        button_frame.pack(fill="x", pady=10)
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.fj_start_button = ctk.CTkButton(button_frame, text="开始羽化拼接", height=40,
+                                             command=self.start_feather_join)
+        self.fj_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.fj_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
+                                            command=self.stop_feather_join, state="disabled", fg_color="red",
+                                            hover_color="darkred")
+        self.fj_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+        self.fj_log_textbox = ctk.CTkTextbox(main_frame, state="disabled", text_color="#A9A9A9")
+        self.fj_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
+
+    def log_feather_join(self, message, clear=False):
+        self.after(0, self._update_log, self.fj_log_textbox, message, clear)
+
+    def start_feather_join(self):
+        self.feather_join_stop_event.clear()
+        self.fj_start_button.configure(state="disabled")
+        self.fj_stop_button.configure(state="normal")
+        self.log_feather_join("处理开始...", clear=True)
+        threading.Thread(target=self.run_feather_join_logic, daemon=True).start()
+
+    def stop_feather_join(self):
+        self.log_feather_join("🔴 发送停止信号...请等待当前文件处理完毕。")
+        self.feather_join_stop_event.set()
+        self.fj_stop_button.configure(state="disabled")
+
+    def _reset_feather_join_buttons(self):
+        self.fj_start_button.configure(state="normal")
+        self.fj_stop_button.configure(state="disabled")
+
+    # --- 羽化拼接功能的核心辅助函数 (移植自 4.py) ---
+    def _fj_detect_gpu_encoder(self):
+        self.log_feather_join("--- 正在检测可用的硬件编码器 ---")
+        ffmpeg_path = self._find_executable("ffmpeg")
+        if not ffmpeg_path:
+            self.log_feather_join("[警告] 找不到 ffmpeg.exe。将默认使用 CPU。")
+            return 'libx264', 'CPU (libx264)'
         try:
-            input_dir = self.avatar_input_folder_entry.get()
-            output_dir = self.avatar_output_folder_entry.get()
-            zoom = self._safe_float_convert(self.avatar_zoom_entry.get(), 2.0)
-            mirror = self.avatar_mirror_switch.get() == 1
-            contrast = self._safe_float_convert(self.avatar_contrast_entry.get(), 1.0)
-            brightness = self._safe_float_convert(self.avatar_brightness_entry.get(), 0.0)
-            saturation = self._safe_float_convert(self.avatar_saturation_entry.get(), 1.0)
-            # --- 核心修改：读取GPU开关状态 ---
-            use_gpu = self.avatar_use_gpu_switch.get() == 1 and self.is_gpu_available
-            # --- 修改结束 ---
-            self.log_avatar(
-                f"--- [诊断] 准备处理。GPU开关状态: {self.avatar_use_gpu_switch.get() == 1}, 程序检测到的GPU可用性 (is_gpu_available): {self.is_gpu_available} ---")
-            if not all([input_dir, output_dir]):
-                self.log_avatar("❌ 错误: 源视频文件夹和输出文件夹都必须填写。");
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run([ffmpeg_path, '-hide_banner', '-encoders'], capture_output=True, text=True,
+                                    check=True, creationflags=creation_flags, encoding='utf-8')
+            encoders_output = result.stdout
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            self.log_feather_join("[警告] 无法执行 'ffmpeg -encoders'。将默认使用 CPU。")
+            return 'libx264', 'CPU (libx264)'
+
+        encoder_priority = [
+            ('h264_nvenc', 'NVIDIA GPU (NVENC)'), ('hevc_nvenc', 'NVIDIA GPU (NVENC HEVC)'),
+            ('h264_qsv', 'Intel GPU (QSV)'), ('hevc_qsv', 'Intel GPU (QSV HEVC)'),
+            ('h264_amf', 'AMD GPU (AMF)'), ('hevc_amf', 'AMD GPU (AMF HEVC)'),
+        ]
+        for encoder, name in encoder_priority:
+            if f"V..... {encoder}" in encoders_output or f"V....D {encoder}" in encoders_output:
+                self.log_feather_join(f"[成功] 检测到并选择: {name}")
+                return encoder, name
+        self.log_feather_join("[信息] 未检测到支持的 GPU 硬件编码器。将使用 CPU。")
+        return 'libx264', 'CPU (libx264)'
+
+    def _fj_find_all_videos(self, directory):
+        supported_formats = ('.mp4', '.mov', '.avi', '.mkv', '.flv', '.webm')
+        video_files = []
+        if not os.path.isdir(directory):
+            self.log_feather_join(f"[警告] 目录不存在: {directory}")
+            return video_files
+        for file in sorted(os.listdir(directory)):
+            if file.lower().endswith(supported_formats):
+                video_files.append(os.path.join(directory, file))
+        return video_files
+
+    def _fj_get_video_duration(self, video_path):
+        ffprobe_path = self._find_executable("ffprobe")
+        if not ffprobe_path:
+            self.log_feather_join("\n[错误] 找不到 'ffprobe' 命令。请确保 FFmpeg 已安装。")
+            return None
+        command = [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration', '-of',
+                   'default=noprint_wrappers=1:nokey=1', video_path]
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(command, capture_output=True, text=True, check=True,
+                                    creationflags=creation_flags, encoding='utf-8')
+            return float(result.stdout.strip())
+        except (subprocess.CalledProcessError, ValueError) as e:
+            self.log_feather_join(f"\n[错误] 使用 ffprobe 获取 '{os.path.basename(video_path)}' 的时长失败: {e}")
+            return None
+
+    def _fj_concatenate_videos(self, video_paths, output_path, base_dir):
+        ffmpeg_path = self._find_executable("ffmpeg")
+        if not ffmpeg_path:
+            self.log_feather_join("[错误] 找不到 ffmpeg.exe，无法拼接视频。")
+            return False
+
+        encoder, _ = self._fj_detect_gpu_encoder()  # 自动检测可用编码器
+        self.log_feather_join(f"--- [预处理] 使用 {encoder} 编码器拼接B视频以确保稳定性 ---")
+
+        list_path = os.path.join(base_dir, "ffmpeg_concat_list.txt")
+        with open(list_path, 'w', encoding='utf-8') as f:
+            for path in video_paths:
+                f.write(f"file '{os.path.abspath(path)}'\n")
+
+        # --- 核心修改点：不再使用-c copy，而是重新编码 ---
+        command = [
+            ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
+            '-c:v', encoder,  # 使用检测到的编码器 (GPU或CPU)
+            '-preset', 'fast',  # 使用一个较快的预设
+            '-c:a', 'aac', '-b:a', '192k',  # 同时统一音频编码
+            output_path
+        ]
+
+        import shlex
+        self.log_feather_join(shlex.join(command))
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            # 为拼接过程增加超时，防止意外卡死 (例如300秒)
+            subprocess.run(command, check=True, capture_output=True, text=True, creationflags=creation_flags,
+                           encoding='utf-8', timeout=300)
+            self.log_feather_join("--- B文件夹视频拼接成功 ---")
+            os.remove(list_path)
+            return True
+        except subprocess.TimeoutExpired:
+            self.log_feather_join(f"\n[错误] FFmpeg 拼接视频超时！请检查B文件夹中的视频文件。")
+            os.remove(list_path)
+            return False
+        except subprocess.CalledProcessError as e:
+            self.log_feather_join(f"\n[错误] FFmpeg 拼接视频失败: {e.stderr}")
+            os.remove(list_path)
+            return False
+    def _fj_create_feathered_join(self, video_a_path, video_b_path, output_path, feather_margin, video_encoder):
+        ffmpeg_path = self._find_executable("ffmpeg")
+        if not ffmpeg_path:
+            self.log_feather_join("[错误] 找不到 ffmpeg.exe，无法执行羽化合并。")
+            return False
+        half_margin = feather_margin / 2
+        filter_complex = (
+            f"[1:v][0:v]scale2ref[b][a];[a][b]blend=all_expr='A*st(0,clip(((H/2+{half_margin})-Y)/{feather_margin},0,1))+B*(1-ld(0))'[v]")
+        command = [
+            ffmpeg_path, '-y', '-i', video_a_path, '-i', video_b_path,
+            '-filter_complex', filter_complex, '-map', '[v]', '-map', '0:a?',
+            '-c:v', video_encoder, '-preset', 'p6' if 'nvenc' in video_encoder else 'fast',
+            '-c:a', 'copy', '-shortest', output_path
+        ]
+        import shlex
+        self.log_feather_join("\n准备执行以下 FFmpeg 羽化合并命令:")
+        self.log_feather_join(shlex.join(command))
+        self.log_feather_join("\n--- 开始执行 FFmpeg 合并 ---")
+        try:
+            creation_flags = 0
+            if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command, check=True, capture_output=True, text=True, creationflags=creation_flags,
+                           encoding='utf-8')
+            self.log_feather_join("--- FFmpeg 合并执行完毕 ---")
+            self.log_feather_join(f"\n处理完成！视频已保存为: {output_path}")
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log_feather_join(f"\n[错误] FFmpeg 执行失败。返回码: {e.returncode}\n{e.stderr}")
+            return False
+
+    def run_feather_join_logic(self):
+        try:
+            dir_a = self.fj_folder_a_entry.get()
+            dir_b = self.fj_folder_b_entry.get()
+            output_dir = self.fj_output_folder_entry.get()
+            feather_margin = self._safe_int_convert(self.fj_margin_entry.get(), 100)
+
+            if not all([dir_a, dir_b, output_dir]):
+                self.log_feather_join("错误: 所有文件夹路径都必须填写。");
                 return
+            os.makedirs(output_dir, exist_ok=True)
 
-            if not self.face_cascade:
-                self.log_avatar("❌ 致命错误: 人脸识别模型未成功加载，无法执行此功能。")
-                return
+            encoder, encoder_friendly_name = self._fj_detect_gpu_encoder()
+            self.log_feather_join(f"\n--- 将使用 [{encoder_friendly_name}] 进行视频编码 ---\n")
 
-            video_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv'))]
-            if not video_files:
-                self.log_avatar("ℹ️ 在指定文件夹中未找到任何视频文件。");
-                return
+            videos_a = self._fj_find_all_videos(dir_a)
+            videos_b = self._fj_find_all_videos(dir_b)
 
-            if os.path.exists(output_dir): shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
-            self.log_avatar(f"🔍 找到 {len(video_files)} 个视频文件，准备开始处理...")
+            if not videos_a: self.log_feather_join("[错误] 在 'A' 文件夹中未找到任何视频文件。")
+            if not videos_b: self.log_feather_join("[错误] 在 'B' 文件夹中未找到任何视频文件。")
+            if not videos_a or not videos_b: return
 
-            processed_count = 0
-            for i, filename in enumerate(video_files):
-                if self.avatar_stop_event.is_set():
-                    self.log_avatar("🔴 任务已中止。");
+            b_video_index = 0
+            for video_a_path in videos_a:
+                if self.feather_join_stop_event.is_set(): self.log_feather_join("🔴 任务已中止。"); break
+                self.log_feather_join(
+                    f"\n{'=' * 50}\n处理 A 文件夹视频: {os.path.basename(video_a_path)}\n{'=' * 50}")
+
+                duration_a = self._fj_get_video_duration(video_a_path)
+                if duration_a is None: continue
+
+                if b_video_index >= len(videos_b):
+                    self.log_feather_join("[警告] B 文件夹中的视频已用尽，无法处理剩余的 A 视频。");
                     break
 
-                self.log_avatar(f"\n--- [任务 {i + 1}/{len(video_files)}] 正在处理: {filename} ---")
-                input_path = os.path.join(input_dir, filename)
-                output_path = os.path.join(output_dir, f"avatar_{filename}")
+                videos_to_use_from_b, b_total_duration = [], 0
+                temp_b_video_index = b_video_index
+                while b_total_duration < duration_a and temp_b_video_index < len(videos_b):
+                    current_b_video = videos_b[temp_b_video_index]
+                    duration_b = self._fj_get_video_duration(current_b_video)
+                    if duration_b is not None:
+                        b_total_duration += duration_b
+                        videos_to_use_from_b.append(current_b_video)
+                    temp_b_video_index += 1
 
-                # --- 核心修改：传递use_gpu参数 ---
-                if self._avatar_worker(input_path, output_path, zoom, mirror, contrast, brightness, saturation,
-                                       use_gpu):
-                    self.log_avatar(f"  ✅ 成功输出到: avatar_{filename}")
-                    processed_count += 1
+                if b_total_duration < duration_a:
+                    self.log_feather_join(
+                        f"[错误] B 文件夹中剩余视频总时长不足以匹配 '{os.path.basename(video_a_path)}'。");
+                    continue
 
-            if not self.avatar_stop_event.is_set():
-                self.log_avatar(f"\n🎉 所有任务处理完毕！共成功处理 {processed_count} 个文件。")
+                b_input_path = ""
+                # 使用输出文件夹作为临时文件存放地，更整洁
+                temp_b_concat_path = os.path.join(output_dir, "temp_b_concatenated.mp4")
+
+                if len(videos_to_use_from_b) == 1:
+                    b_input_path = videos_to_use_from_b[0]
+                    self.log_feather_join(f"为 A 视频匹配了单个 B 视频: {os.path.basename(b_input_path)}")
+                else:
+                    self.log_feather_join("需要拼接以下 B 视频以满足时长需求:")
+                    for v in videos_to_use_from_b: self.log_feather_join(f" - {os.path.basename(v)}")
+                    if self._fj_concatenate_videos(videos_to_use_from_b, temp_b_concat_path, output_dir):
+                        b_input_path = temp_b_concat_path
+                    else:
+                        self.log_feather_join("拼接失败，跳过当前 A 视频的处理。");
+                        continue
+
+                output_filename = f"merged_{os.path.splitext(os.path.basename(video_a_path))[0]}.mp4"
+                output_path = os.path.join(output_dir, output_filename)
+
+                if self._fj_create_feathered_join(video_a_path, b_input_path, output_path, feather_margin, encoder):
+                    self.log_feather_join("\n合并成功，正在删除已使用的 B 文件夹视频:")
+                    for video_to_delete in videos_to_use_from_b:
+                        try:
+                            os.remove(video_to_delete)
+                            self.log_feather_join(f" - 已删除: {os.path.basename(video_to_delete)}")
+                        except OSError as e:
+                            self.log_feather_join(
+                                f" - [错误] 删除文件失败: {os.path.basename(video_to_delete)} - {e}")
+                    b_video_index += len(videos_to_use_from_b)
+
+                if os.path.exists(temp_b_concat_path): os.remove(temp_b_concat_path)
+
+            if not self.feather_join_stop_event.is_set(): self.log_feather_join("\n🎉 所有任务处理完毕。")
 
         except Exception as e:
-            self.log_avatar(f"发生未预料的严重错误: {e}")
-            traceback.print_exc()
+            self.log_feather_join(f"发生未预料的严重错误: {e}")
+            import traceback
+            self.log_feather_join(traceback.format_exc())
         finally:
-            self.after(0, self._reset_avatar_buttons)
+            self.after(0, self._reset_feather_join_buttons)
 
 
 
@@ -9571,14 +9729,11 @@ class App(ctk.CTk):
                 'input_folder': self.uniform_res_input_folder_entry.get(),
                 'output_folder': self.uniform_res_output_folder_entry.get()
             },
-            'avatar_settings': {
-                'input_folder': self.avatar_input_folder_entry.get(),
-                'output_folder': self.avatar_output_folder_entry.get(),
-                'zoom': self.avatar_zoom_entry.get(),
-                'mirror': self.avatar_mirror_switch.get(),
-                'contrast': self.avatar_contrast_entry.get(),
-                'brightness': self.avatar_brightness_entry.get(),
-                'saturation': self.avatar_saturation_entry.get()
+            'feather_join_settings': {  # <-- 添加这个新字典
+                'folder_a': self.fj_folder_a_entry.get(),
+                'folder_b': self.fj_folder_b_entry.get(),
+                'output_folder': self.fj_output_folder_entry.get(),
+                'margin': self.fj_margin_entry.get()
             },
             'porter_settings': {
                 'dir_a': self.porter_dir_a_entry.get(),
@@ -9809,14 +9964,11 @@ class App(ctk.CTk):
         uni_res_s = settings.get('uniform_resolution_settings', {})
         _load_entry('uniform_res_input_folder_entry', uni_res_s, 'input_folder')
         _load_entry('uniform_res_output_folder_entry', uni_res_s, 'output_folder')
-        avatar_s = settings.get('avatar_settings', {})
-        _load_entry('avatar_input_folder_entry', avatar_s, 'input_folder')
-        _load_entry('avatar_output_folder_entry', avatar_s, 'output_folder')
-        _load_entry('avatar_zoom_entry', avatar_s, 'zoom', '2.0')
-        _load_switch('avatar_mirror_switch', avatar_s, 'mirror', False)
-        _load_entry('avatar_contrast_entry', avatar_s, 'contrast', '1.0')
-        _load_entry('avatar_brightness_entry', avatar_s, 'brightness', '0.0')
-        _load_entry('avatar_saturation_entry', avatar_s, 'saturation', '1.0')
+        fj_s = settings.get('feather_join_settings', {})
+        _load_entry('fj_folder_a_entry', fj_s, 'folder_a')
+        _load_entry('fj_folder_b_entry', fj_s, 'folder_b')
+        _load_entry('fj_output_folder_entry', fj_s, 'output_folder')
+        _load_entry('fj_margin_entry', fj_s, 'margin', '100')
 
         ps = settings.get('porter_settings', {})
         _load_entry('porter_dir_a_entry', ps, 'dir_a')
