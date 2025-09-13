@@ -3559,7 +3559,7 @@ class App(ctk.CTk):
     def _apply_text_and_remix_worker(self, video_pool, group_folder, video_name, text_line, config, use_gpu,
                                      duration_instruction):
         """
-        【v2.10 逻辑修正版】修复了在单段时长+混剪模式下，次文案不显示的问题。
+        【v2.10 逻辑修正版 + 片头拼接功能】修复了在单段时长+混剪模式下，次文案不显示的问题，并增加了片头拼接逻辑。
         """
         temp_files_to_delete = []
         original_videos_used = []
@@ -3589,6 +3589,54 @@ class App(ctk.CTk):
                 self.log_video(f"\n- [单视频模式] 正在处理视频")
                 base_video_path = video_pool[0]
                 original_videos_used.append(base_video_path)
+
+            # ==================== 新增逻辑：拼接片头 ====================
+            try:
+                video_folder = self.video_folder_entry.get()
+                intro_subfolder_path = os.path.join(video_folder, "1")
+
+                # 检查片头文件夹是否存在且不是空目录
+                if os.path.isdir(intro_subfolder_path):
+                    intro_videos = [f for f in os.listdir(intro_subfolder_path) if
+                                    f.lower().endswith(('.mp4', '.mov', '.avi'))]
+                    if intro_videos:
+                        # 获取主视频时长
+                        duration = self._get_video_duration(base_video_path)
+                        if duration > 25:
+                            self.log_video(f"  -> 视频时长 ({duration:.2f}s) > 25s, 触发片头拼接逻辑。")
+
+                            # 随机选择一个片头视频
+                            chosen_intro_name = random.choice(intro_videos)
+                            intro_video_path = os.path.join(intro_subfolder_path, chosen_intro_name)
+                            self.log_video(f"  -> 从 '1' 文件夹中随机选择片头: {chosen_intro_name}")
+
+                            # 定义临时拼接文件的路径
+                            temp_concatenated_path = os.path.join(group_folder,
+                                                                  f"temp_intro_{random.randint(1000, 9999)}.mp4")
+
+                            # 调用拼接函数
+                            success = self._concatenate_for_intro(intro_video_path, base_video_path,
+                                                                  temp_concatenated_path, use_gpu)
+
+                            if success:
+                                self.log_video("  -> ✅ 片头拼接成功。")
+                                # 如果拼接前的base_video本身就是个临时文件, 将其加入清理列表
+                                if base_video_path not in original_videos_used:
+                                    temp_files_to_delete.append(base_video_path)
+
+                                # 更新 base_video_path 为新拼接的视频
+                                base_video_path = temp_concatenated_path
+                                # 将新的临时文件加入清理列表
+                                temp_files_to_delete.append(temp_concatenated_path)
+                            else:
+                                self.log_video("  -> ❌ 片头拼接失败，将继续使用原视频处理。")
+                        elif duration > 0:  # 仅在成功获取时长时打印日志
+                            self.log_video(f"  -> 视频时长 ({duration:.2f}s) 不超过25s, 跳过片头拼接。")
+                    else:
+                        self.log_video("  -> '1' 号子文件夹为空，跳过片头拼接。")
+            except Exception as e:
+                self.log_video(f"  -> 警告: 在处理片头逻辑时发生意外错误: {e}")
+            # ==================== 新增逻辑结束 ====================
 
             # 步骤 2: 解析文案，生成独立的、带配置的图层信息
             self.log_video("  -> 步骤1: 解析文案并生成独立图层...")
@@ -3651,9 +3699,7 @@ class App(ctk.CTk):
                         })
                         current_time += part_duration
 
-            # (后续步骤 3 和 4 的代码与之前版本完全相同，此处省略以保持简洁)
-            # ...
-            # ...
+            # (后续步骤 3 和 4 的代码与之前版本完全相同)
             # --- 步骤 3: 预处理视频 + 保存PNG ---
             corrected_video_path, temp_file = self._preprocess_video_orientation(base_video_path, group_folder,
                                                                                  self.log_video)
@@ -3735,6 +3781,64 @@ class App(ctk.CTk):
                         os.remove(f)
                     except OSError:
                         pass
+
+    def _get_video_duration(self, video_path):
+        """使用 ffprobe 获取视频时长"""
+        ffprobe_path = self._find_executable("ffprobe")
+        if not ffprobe_path:
+            self.log_video("  -> 警告: 找不到 ffprobe.exe, 无法获取视频时长。")
+            return 0
+        try:
+            command = [
+                ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1', os.path.normpath(video_path)
+            ]
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(command, check=True, capture_output=True, text=True, creationflags=creation_flags)
+            return float(result.stdout.strip())
+        except Exception as e:
+            self.log_video(f"  -> 警告: 获取视频 '{os.path.basename(video_path)}' 时长失败: {e}")
+            return 0
+
+    def _concatenate_for_intro(self, intro_path, main_path, output_path, use_gpu):
+        """使用ffmpeg concat filter拼接片头和主视频"""
+        ffmpeg_path = self._find_executable("ffmpeg")
+        if not ffmpeg_path:
+            self.log_video("  -> 错误: 找不到 ffmpeg.exe, 无法拼接片头。")
+            return False
+        try:
+            # 使用concat filter，它对不同编码格式的视频兼容性更好，但需要重新编码
+            filter_complex_str = f"[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]"
+            output_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
+            preset = 'fast' if use_gpu else 'medium'
+
+            command = [
+                ffmpeg_path, '-y',
+                '-i', os.path.normpath(intro_path),
+                '-i', os.path.normpath(main_path),
+                '-filter_complex', filter_complex_str,
+                '-map', '[v]',
+                '-map', '[a]',
+                '-c:v', output_codec,
+                '-preset', preset,
+                '-c:a', 'aac', '-b:a', '192k',
+                os.path.normpath(output_path)
+            ]
+
+            creation_flags = 0
+            if sys.platform == 'win32':
+                creation_flags = subprocess.CREATE_NO_WINDOW
+            subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
+                           creationflags=creation_flags)
+            return True
+        except subprocess.CalledProcessError as e:
+            self.log_video(f"  -> 错误: FFmpeg 拼接片头失败: {e.stderr.strip()}")
+            return False
+        except Exception as e:
+            self.log_video(f"  -> 错误: 拼接片头时发生未知错误: {e}")
+            return False
     def _apply_text_to_video(self, input_video_path, group_folder, video_name, text_line, config, use_gpu,
                              duration_param, temp_files_to_delete):
         """【最终修正版】将原有的单个视频处理逻辑封装起来，并修复所有已知错误"""
