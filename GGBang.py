@@ -6814,7 +6814,14 @@ class App(ctk.CTk):
             template_dir = self.news_template_folder_entry.get()
             output_dir = self.news_output_folder_entry.get()
 
-            # --- 参数获取部分 (与原版相同) ---
+            # --- 优化点: 允许文案为空 ---
+            # 如果文案为空，all_text_lines将是一个空列表，后续逻辑会处理这种情况
+            all_text_lines = [line.strip() for line in
+                              self.news_text_input_area.get("1.0", "end-1c").strip().split('\n') if line.strip()]
+            if not all_text_lines:
+                self.log_news_greenscreen("ℹ️ 信息: 未输入任何文案，将生成无字幕视频。")
+
+            # --- 其它参数获取逻辑保持不变 ---
             try:
                 duration_str = self.news_crop_duration_entry.get()
                 original_duration = float(duration_str) if duration_str.strip() else 0
@@ -6830,17 +6837,10 @@ class App(ctk.CTk):
 
             full_font_path = self.news_font_file_entry.get()
 
-            # 更新验证逻辑
-            if not (full_font_path and os.path.exists(full_font_path)):
-                # 使用 os.path.basename 来只显示文件名，避免过长的路径刷屏
+            # 如果启用了文案但字体文件无效，则报错
+            if all_text_lines and not (full_font_path and os.path.exists(full_font_path)):
                 self.log_news_greenscreen(
-                    f"错误: 选择的字体文件 '{os.path.basename(full_font_path)}' 无效或路径不正确！")
-                return
-
-            all_text_lines = [line.strip() for line in
-                              self.news_text_input_area.get("1.0", "end-1c").strip().split('\n') if line.strip()]
-            if not all_text_lines:
-                self.log_news_greenscreen("错误: 文案输入为空，无法进行处理。")
+                    f"错误: 已输入文案但选择的字体文件 '{os.path.basename(full_font_path)}' 无效或路径不正确！")
                 return
 
             use_gpu = self.news_use_gpu_switch.get() == 1
@@ -6864,8 +6864,6 @@ class App(ctk.CTk):
                 'corner_radius': int(self.news_corner_radius_entry.get())
             }
 
-            # --- 核心修改点：重构任务生成与主循环 ---
-
             video_ext = ('.mp4', '.mov', '.avi', '.mkv')
             content_files = sorted([f for f in os.listdir(content_dir) if f.lower().endswith(video_ext)])
             template_subfolders = sorted(
@@ -6877,7 +6875,6 @@ class App(ctk.CTk):
             self.log_news_greenscreen(
                 f"\n★★★ 模板设置完成！将为 {len(template_subfolders)} 个模板子文件夹分别生成视频。 ★★★")
 
-            # 1. 外层循环：遍历每一个模板子文件夹
             for subfolder_name in template_subfolders:
                 if self.news_stop_event.is_set(): break
                 self.log_news_greenscreen(f"\n\n---=== 开始处理模板组: {subfolder_name} ===---")
@@ -6890,7 +6887,7 @@ class App(ctk.CTk):
                     self.log_news_greenscreen(f"  -> 警告: 模板子文件夹 '{subfolder_name}' 为空，已跳过。")
                     continue
 
-                # 2. 在子文件夹内部，构建当前组的任务列表
+                # --- 优化点: 任务数量以视频文件配对为准 ---
                 subfolder_task_list = []
                 for content_filename in content_files:
                     for template_filename in template_files_in_subfolder:
@@ -6900,19 +6897,19 @@ class App(ctk.CTk):
                             'template': template_filename
                         })
 
-                # 3. 独立计算当前子文件夹需要处理的任务数量
-                num_tasks_for_subfolder = min(len(subfolder_task_list), len(all_text_lines))
+                num_tasks_for_subfolder = len(subfolder_task_list)
                 self.log_news_greenscreen(
-                    f"  -> 此组将使用 {len(all_text_lines)} 条文案，生成 {num_tasks_for_subfolder} 个视频。")
+                    f"  -> 此组将生成 {num_tasks_for_subfolder} 个视频。")
                 if num_tasks_for_subfolder == 0: continue
 
-                # 4. 内层循环：处理当前子文件夹的所有任务
                 for i in range(num_tasks_for_subfolder):
                     if self.news_stop_event.is_set(): break
 
                     try:
                         task = subfolder_task_list[i]
-                        current_text = all_text_lines[i]
+
+                        # --- 优化点: 仅当文案存在时才获取并应用 ---
+                        current_text = all_text_lines[i] if i < len(all_text_lines) else ""
 
                         self.log_news_greenscreen(f"\n--- 任务进度: {i + 1}/{num_tasks_for_subfolder} ---")
                         content_path = os.path.join(content_dir, task['content'])
@@ -6924,12 +6921,17 @@ class App(ctk.CTk):
                         output_path = os.path.join(output_subfolder_path, output_basename)
 
                         self.log_news_greenscreen(f"正在合成: '{task['content']}' -> '{task['template']}'")
-                        self.log_news_greenscreen(f"添加文案: {current_text}")
 
-                        text_config['text'] = current_text
+                        # 如果有文案，则传递配置，否则传递None
+                        current_text_config = None
+                        if current_text:
+                            self.log_news_greenscreen(f"添加文案: {current_text}")
+                            text_config['text'] = current_text
+                            current_text_config = text_config
+
                         success, message = self._news_process_video(
                             content_path, template_path, output_path,
-                            template_content_roi, text_config,
+                            template_content_roi, current_text_config,
                             use_gpu, gpu_codec, crop_duration,
                             mirror_content, zoom_factor
                         )
@@ -7397,7 +7399,10 @@ class App(ctk.CTk):
         self.video_log_textbox = ctk.CTkTextbox(tab, state="disabled", text_color="#A9A9A9"); self.video_log_textbox.pack(expand=True, fill="both", padx=10, pady=10)
 
     def _create_random_remix_clip(self, target_duration, available_videos, temp_dir, logger):
-        """【v2.1 修正版】修复了临时混剪视频未被清理的问题"""
+        """
+        【v2.2 优化版】为混剪模式生成一个随机拼接的视频。
+        如果目标时长 > 50秒，则每个选中的片段会被重复使用4次。
+        """
         logger(f"  -> [混剪] 目标时长: {target_duration:.2f}s。开始构建FFmpeg混剪任务...")
 
         ffmpeg_path = self._find_executable("ffmpeg")
@@ -7406,85 +7411,99 @@ class App(ctk.CTk):
             logger("  ❌ 错误: 找不到 ffmpeg.exe 或 ffprobe.exe")
             return None, [], []
 
+        use_4x_repetition = target_duration > 50
+        if use_4x_repetition:
+            logger(f"    -> [长视频策略] 目标时长 > 50s，启用片段2次重复拼接。")
+
         creation_flags = 0
-        if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+        if sys.platform == 'win32':
+            creation_flags = subprocess.CREATE_NO_WINDOW
 
         concat_list_path = os.path.join(temp_dir, f"concat_list_{random.randint(1000, 9999)}.txt")
         clips_info = []
-        temp_files_created_this_run = [concat_list_path]  # 列表文件本身也需要清理
+        temp_files_created_this_run = [concat_list_path]
         original_videos_used = []
         current_duration = 0
         video_pool = list(available_videos)
+        random.shuffle(video_pool)  # 先将视频池打乱一次，增加随机性
 
         try:
             while current_duration < target_duration:
                 if not video_pool:
                     logger("    -> [警告] 所有可用视频都已尝试过，无法继续拼接。")
                     break
-                original_video_path = random.choice(video_pool)
+
+                original_video_path = video_pool.pop(0)  # 从列表头部取出一个，确保不会在本轮混剪中再次选中
                 try:
                     corrected_path, temp_file = self._preprocess_video_orientation(original_video_path, temp_dir,
                                                                                    logger)
                     if not corrected_path:
-                        video_pool.remove(original_video_path);
-                        continue
-                    if temp_file: temp_files_created_this_run.append(temp_file)
+                        continue  # 如果预处理失败，跳过这个视频
+                    if temp_file:
+                        temp_files_created_this_run.append(temp_file)
 
                     cmd_probe = [ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of",
                                  "default=noprint_wrappers=1:nokey=1", os.path.normpath(corrected_path)]
                     result = subprocess.run(cmd_probe, check=True, capture_output=True, text=True,
                                             creationflags=creation_flags)
                     clip_duration = float(result.stdout.strip())
-                    if clip_duration <= 0: raise ValueError("视频时长为0或无效")
+                    if clip_duration <= 0:
+                        raise ValueError("视频时长为0或无效")
 
-                    if original_video_path not in original_videos_used: original_videos_used.append(original_video_path)
+                    if original_video_path not in original_videos_used:
+                        original_videos_used.append(original_video_path)
 
-                    remaining_needed = target_duration - current_duration
-                    if clip_duration >= remaining_needed:
-                        clips_info.append({'path': corrected_path, 'duration': remaining_needed})
-                        logger(
-                            f"    -> 添加片段: {os.path.basename(original_video_path)} (裁剪为 {remaining_needed:.2f}s)")
-                        current_duration += remaining_needed
-                        break
-                    else:
-                        clips_info.append({'path': corrected_path, 'duration': None})
-                        logger(f"    -> 添加片段: {os.path.basename(original_video_path)} (完整 {clip_duration:.2f}s)")
-                        current_duration += clip_duration
-                        video_pool.remove(original_video_path)
-                except Exception as e:
+                    # 根据是否启用长视频策略，决定重复次数
+                    repetitions = 2 if use_4x_repetition else 1
+                    duration_to_add = clip_duration * repetitions
+
                     logger(
-                        f"    -> [警告] 加载或处理视频 {os.path.basename(original_video_path)} 失败: {e}，将从视频池中移除。")
-                    if original_video_path in video_pool: video_pool.remove(original_video_path)
+                        f"    -> 添加片段: {os.path.basename(original_video_path)} ({clip_duration:.2f}s) x {repetitions}次 = {duration_to_add:.2f}s")
+
+                    # 将同一个片段的路径重复添加N次
+                    for _ in range(repetitions):
+                        clips_info.append({'path': corrected_path})
+
+                    current_duration += duration_to_add
+
+                except Exception as e:
+                    logger(f"    -> [警告] 加载或处理视频 {os.path.basename(original_video_path)} 失败: {e}。")
                     continue
 
             if not clips_info:
                 logger("  -> [错误] 未能收集到任何有效的视频片段用于混剪。")
                 return None, temp_files_created_this_run, []
+
+            # 写入拼接列表文件
             with open(concat_list_path, 'w', encoding='utf-8') as f:
                 for info in clips_info:
                     safe_path = os.path.normpath(info['path']).replace('\\', '/')
                     f.write(f"file '{safe_path}'\n")
-                    if info['duration'] is not None: f.write(f"outpoint {info['duration']:.3f}\n")
 
             temp_output_path = os.path.join(temp_dir, f"remix_{random.randint(1000, 9999)}.mp4")
-
-            # 【关键修正】将生成的临时混剪视频本身也加入待删除列表
             temp_files_created_this_run.append(temp_output_path)
 
-            command = [ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path, '-c', 'copy',
-                       os.path.normpath(temp_output_path)]
-            self.log_video(f"  -> [混剪] 正在调用FFmpeg核心进行高速拼接...")
+            # 该命令仅负责拼接，最终的精确裁剪由调用此函数的 _apply_text_and_remix_worker 方法通过 -t 参数完成。
+            # 这种方式更稳定，无需计算复杂的 outpoint。
+            command = [
+                ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', concat_list_path,
+                '-c', 'copy',
+                os.path.normpath(temp_output_path)
+            ]
+
+            logger(f"  -> [混剪] 正在调用FFmpeg核心进行高速拼接...")
             subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8', errors='ignore',
                            creationflags=creation_flags)
-            self.log_video(f"  -> [混剪] 成功生成临时混剪视频。")
+            logger(f"  -> [混剪] 成功生成临时混剪视频。")
 
             return temp_output_path, temp_files_created_this_run, original_videos_used
+
         except subprocess.CalledProcessError as e:
-            self.log_video(f"  ❌ FFmpeg 拼接失败:\n{e.stderr.strip()}")
+            logger(f"  ❌ FFmpeg 拼接失败:\n{e.stderr.strip()}")
             return None, temp_files_created_this_run, []
-        finally:
-            # concat_list_path 已在 temp_files_created_this_run 中，会被统一清理，无需在此处单独删除
-            pass
+        except Exception as general_error:
+            logger(f"  ❌ 创建混剪视频时发生未知错误: {general_error}")
+            return None, temp_files_created_this_run, []
 
     # 请用这个版本完整替换你的 setup_image_main_tab 函数
     def setup_image_main_tab(self, tab):
