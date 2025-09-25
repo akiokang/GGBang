@@ -3429,7 +3429,7 @@ class App(ctk.CTk):
 
     def run_video_logic_hybrid(self):
         """
-        【v2.3 媒体兼容版】支持视频和图片作为输入源。
+        【v2.4 时长前置版】支持视频和图片作为输入源, 并从每行文案前缀解析时长。
         """
         try:
             # --- 1. 获取所有UI输入和配置 ---
@@ -3437,45 +3437,80 @@ class App(ctk.CTk):
             if not config: self.after(0, self._reset_video_buttons); return
 
             use_gpu = self.video_use_gpu_switch.get() == 1
-
             video_folder = self.video_folder_entry.get()
             output_folder = self.video_output_folder_entry.get()
             all_input_text = self.video_text_input_box.get("1.0", "end-1c")
 
-            text_lines = [line.strip() for line in all_input_text.splitlines() if line.strip()]
+            # --- 【核心修改点】---
+            # 1. 移除旧的时长读取逻辑
+            # durations_str = self.video_durations_entry.get()
+            # duration_instructions = self._parse_duration_string(durations_str)
+
+            # 2. 解析新的 "时长--文案" 格式
+            raw_text_lines = [line.strip() for line in all_input_text.splitlines() if
+                              line.strip() and "例如:" not in line]
+
+            text_lines = []
+            duration_instructions = []
+            is_duration_specified = False
+
+            self.log_video("--- 开始解析文案与时长 ---")
+            for i, line in enumerate(raw_text_lines):
+                if '--' in line:
+                    parts = line.split('--', 1)
+                    duration_str = parts[0].strip()
+                    caption = parts[1].strip()
+                    try:
+                        # 尝试将前缀转换为浮点数时长
+                        duration = float(duration_str)
+                        if duration <= 0:
+                            self.log_video(f"  -> 警告: 第 {i + 1} 行的时长 '{duration_str}' 无效，将使用视频默认时长。")
+                            duration_instructions.append(None)  # 时长无效
+                        else:
+                            # 这里我们只处理简单时长，混剪模式的复杂时长(5-4-3)由worker内部处理
+                            duration_instructions.append(duration)
+                            is_duration_specified = True
+                        text_lines.append(caption)
+                        self.log_video(f"  -> 第 {i + 1} 行: 解析到时长 {duration:.2f}s, 文案: '{caption[:20]}...'")
+                    except ValueError:
+                        self.log_video(
+                            f"  -> 警告: 第 {i + 1} 行的时长前缀 '{duration_str}' 不是有效数字，将整行视为文案。")
+                        duration_instructions.append(None)  # 没有有效时长
+                        text_lines.append(line)  # 整行都是文案
+                else:
+                    # 如果没有'--'分隔符，则认为没有指定时长
+                    duration_instructions.append(None)
+                    text_lines.append(line)
+                    self.log_video(f"  -> 第 {i + 1} 行: 未指定时长, 文案: '{line[:20]}...'")
+
+            # 3. 移除旧的验证逻辑, 因为新逻辑确保了两个列表长度一致
+            # if is_duration_specified and len(text_lines) != len(duration_instructions): ...
+            # --- 修改结束 ---
+
             if not text_lines:
-                self.log_video("错误: 文案输入为空。");
+                self.log_video("错误: 有效文案为空。");
                 self.after(0, self._reset_video_buttons);
                 return
 
-            durations_str = self.video_durations_entry.get()
-            duration_instructions = self._parse_duration_string(durations_str)
-            is_duration_specified = bool(duration_instructions)
-
-            if is_duration_specified and len(text_lines) != len(duration_instructions):
-                self.log_video(
-                    f"❌ 错误: 文案有 {len(text_lines)} 行，但时长指令有 {len(duration_instructions)} 段，两者数量必须完全一致！")
-                self.after(0, self._reset_video_buttons);
-                return
-
-            # --- 核心修改：同时扫描视频和图片 ---
             SUPPORTED_MEDIA = ('.mp4', '.mov', '.avi', '.png', '.jpg', '.jpeg', '.webp')
-            all_original_media = [os.path.join(video_folder, f) for f in os.listdir(video_folder) if f.lower().endswith(SUPPORTED_MEDIA)]
+            all_original_media = [os.path.join(video_folder, f) for f in os.listdir(video_folder) if
+                                  f.lower().endswith(SUPPORTED_MEDIA)]
             if not all_original_media:
                 self.log_video("错误: 视频文件夹中没有任何有效的视频或图片文件。");
                 return
-            # --- 修改结束 ---
 
             group_names, num_groups = [], 0
             num_groups_str = self.video_num_groups_entry.get().strip()
             phone_serials_str = self.video_phone_serial_entry.get().strip()
             if phone_serials_str:
                 group_names = [name.strip() for name in phone_serials_str.split('.') if name.strip()]
-                if not group_names: self.log_video("错误: 手机序号输入无效。"); self.after(0, self._reset_video_buttons); return
+                if not group_names: self.log_video("错误: 手机序号输入无效。"); self.after(0,
+                                                                                          self._reset_video_buttons); return
                 num_groups = len(group_names)
             elif num_groups_str:
                 num_groups = self._safe_int_convert(num_groups_str, 0)
-                if num_groups <= 0: self.log_video("错误: '生成组数' 必须是一个有效的正整数。"); self.after(0, self._reset_video_buttons); return
+                if num_groups <= 0: self.log_video("错误: '生成组数' 必须是一个有效的正整数。"); self.after(0,
+                                                                                                           self._reset_video_buttons); return
                 group_names = [f"group_{i + 1}" for i in range(num_groups)]
             else:
                 self.log_video("错误: '生成组数' 或 '手机序号' 必须填写一个。");
@@ -3509,7 +3544,8 @@ class App(ctk.CTk):
                         self.video_stop_event.set();
                         break
 
-                    duration_instruction = duration_instructions[j] if is_duration_specified else None
+                    # 获取当前任务对应的时长
+                    duration_instruction = duration_instructions[j]
                     output_name = f"{group_name}_{j + 1}.mp4"
 
                     try:
@@ -6750,42 +6786,30 @@ class App(ctk.CTk):
                 # 如果是混剪模式，在处理完一个绿幕视频后就跳出内层背景循环
                 if is_remix_mode:
                     continue
+
     def _news_process_video(self, content_path, template_path, output_path, content_roi, text_config, use_gpu=False,
                             gpu_codec='libx264', crop_duration=0, mirror_content=False, zoom_factor=1.0):
-        """【终极修复版】使用内存管道技术，彻底解决中文路径问题"""
+        """【最终优化版】当未指定裁剪时长时，自动以最短的输入视频为准，解决时长不匹配问题。"""
         temp_text_image_path = None
         try:
             ffmpeg_path = self._find_executable("ffmpeg")
             if not ffmpeg_path:
                 return False, "找不到 ffmpeg.exe"
 
-            # --- 核心修复：使用内存管道技术提取第一帧 ---
+            # 使用内存管道技术提取第一帧
             self.log_news_greenscreen("  -> 使用FFmpeg提取模板视频第一帧到内存...")
-
             command_extract = [
-                ffmpeg_path,
-                '-i', os.path.normpath(template_path),
-                '-frames:v', '1',  # 只提取1帧
-                '-f', 'image2pipe',  # 指定输出格式为管道
-                '-vcodec', 'png',  # 指定输出编码为PNG
-                '-'  # '-' 代表输出到 stdout (标准输出)
+                ffmpeg_path, '-i', os.path.normpath(template_path),
+                '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'
             ]
-
             creation_flags = 0
             if sys.platform == 'win32':
                 creation_flags = subprocess.CREATE_NO_WINDOW
-
-            # 执行命令并捕获标准输出
             result = subprocess.run(command_extract, check=True, capture_output=True, creationflags=creation_flags)
-
-            # 将从管道接收到的二进制数据转换为Numpy数组
             image_data = np.frombuffer(result.stdout, np.uint8)
-            # 使用OpenCV从内存中的Numpy数组解码出图像
             template_first_frame = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
-
             if template_first_frame is None:
                 return False, "无法从内存数据中解码出图像帧。"
-            # --- 修复结束 ---
 
             template_height, template_width, _ = template_first_frame.shape
             hsv = cv2.cvtColor(template_first_frame, cv2.COLOR_BGR2HSV)
@@ -6813,7 +6837,6 @@ class App(ctk.CTk):
                                                     f"temp_text_{random.randint(1000, 9999)}.png")
                 temp_text_image.save(temp_text_image_path)
 
-            # 为最终的合成命令也准备好带引号的安全路径
             safe_ffmpeg_path = f'"{os.path.normpath(ffmpeg_path)}"'
             safe_content_path = f'"{os.path.normpath(content_path)}"'
             safe_template_path_final = f'"{os.path.normpath(template_path)}"'
@@ -6824,62 +6847,45 @@ class App(ctk.CTk):
             if temp_text_image_path:
                 inputs_str += f" -i {safe_text_path}"
 
-            crop_str = f"-t {crop_duration}" if crop_duration > 0 else ""
-
-            # --- 核心修改：构建新的、包含镜像和放大逻辑的FFmpeg滤镜链 ---
             filters = []
             content_x, content_y, content_w, content_h = content_roi
-
-            # 1. 裁剪出原始的内容区域
             filters.append(f"[0:v]crop={content_w}:{content_h}:{content_x}:{content_y}[cropped_content]")
-
             last_content_stream = "[cropped_content]"
 
-            # 2. 如果需要放大，应用缩放和中心裁剪滤镜
             if zoom_factor > 1.0:
                 self.log_news_greenscreen(f"  -> 应用放大: {zoom_factor:.2f}倍")
-                # iw, ih 代表当前流的输入宽度和高度
                 filters.append(f"{last_content_stream}scale=iw*{zoom_factor}:ih*{zoom_factor}[zoomed]")
                 filters.append(f"[zoomed]crop={content_w}:{content_h}[centered_zoom]")
                 last_content_stream = "[centered_zoom]"
-
-            # 3. 如果需要镜像，应用水平翻转滤镜
             if mirror_content:
                 self.log_news_greenscreen("  -> 应用内容镜像")
                 filters.append(f"{last_content_stream}hflip[flipped]")
                 last_content_stream = "[flipped]"
 
-            # 4. 将最终处理好的内容，缩放到绿幕区域大小
             filters.append(f"{last_content_stream}scale={gw}:{gh}[content_ready]")
-
-            # 5. 将内容叠加到模板上
             filters.append(f"[1:v][content_ready]overlay={gx}:{gy}[video_composited]")
 
-            # 6. 添加文字图层 (逻辑不变)
             last_final_stream = "[video_composited]"
-            final_map = last_final_stream
+            final_map = "[v_out]"
             if temp_text_image_path:
                 text_x = (template_width - text_config['box_w']) / 2
                 text_y = gy - text_config['box_h'] - text_config['y_offset']
                 filters.append(f"{last_final_stream}[2:v]overlay={text_x}:{text_y},format=yuv420p[v_out]")
-                final_map = "[v_out]"
             else:
-                filters.append(f"{last_final_stream},format=yuv420p[v_out]")
-                final_map = "[v_out]"
+                # 修复了之前版本中可能存在的逗号语法错误
+                filters.append(f"{last_final_stream}format=yuv420p[v_out]")
 
             filter_complex_string = ";".join(filters)
-            # --- 修改结束 ---
-
             map_str = f'-map "{final_map}" -map 0:a?'
-
             codec_to_use = gpu_codec if use_gpu and self.is_gpu_available else 'libx264'
             codec_str = f"-c:v {codec_to_use} -preset medium -c:a aac -b:a 192k"
 
-            # --- 需求 2 修改点 ---
-            # 不再探测模板时长，直接使用传入的 crop_duration 作为最终输出时长
-            duration_str = f"-t {crop_duration}" if crop_duration > 0 else ""
+            # --- 主要优化点 ---
+            # 如果设置了“预裁剪时长”，则使用 -t 参数精确控制输出时长。
+            # 如果没有设置，则使用 -shortest 参数，让视频在最短的输入文件（内容视频或模板）结束后自动停止。
+            duration_str = f"-t {crop_duration}" if crop_duration > 0 else "-shortest"
+            # --- 优化结束 ---
 
-            # 最终命令中移除了开头的 crop_str，只使用结尾的 duration_str 来控制总时长
             command_string = f'{safe_ffmpeg_path} -y {inputs_str} -filter_complex "{filter_complex_string}" {map_str} {codec_str} {duration_str} {safe_output_path}'
 
             self.log_news_greenscreen("  -> 正在调用FFmpeg核心进行高速合成...")
@@ -7493,13 +7499,22 @@ class App(ctk.CTk):
 
         self.create_folder_selection_row(tab, "视频文件夹:", "选择包含视频的文件夹", "video_folder_entry")
         self.create_folder_selection_row(tab, "输出文件夹:", "选择视频处理结果的存放位置", "video_output_folder_entry")
-        duration_frame = ctk.CTkFrame(tab, fg_color="transparent")
-        duration_frame.pack(fill="x", padx=10, pady=5, anchor="w")
-        ctk.CTkLabel(duration_frame, text="视频时长秒(用点.分隔):", width=120, anchor="w").pack(side="left")
-        self.video_durations_entry = ctk.CTkEntry(duration_frame, placeholder_text="例: 5,6,5 (与文案数量对应)")
-        self.video_durations_entry.pack(side="left", fill="x", expand=True)
-        ctk.CTkLabel(tab, text="输入文案 (用'/'换行, 用'&'分隔块):").pack(anchor="w", padx=10, pady=(10, 0))
-        self.video_text_input_box = ctk.CTkTextbox(tab, height=150); self.video_text_input_box.pack(fill="x", padx=10, pady=(5,10), expand=True)
+
+        # --- 【核心修改点】---
+        # 1. 下面这部分创建“视频时长秒”输入框的代码已被完全注释掉或删除
+        # duration_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        # duration_frame.pack(fill="x", padx=10, pady=5, anchor="w")
+        # ctk.CTkLabel(duration_frame, text="视频时长秒(用点.分隔):", width=120, anchor="w").pack(side="left")
+        # self.video_durations_entry = ctk.CTkEntry(duration_frame, placeholder_text="例: 5,6,5 (与文案数量对应)")
+        # self.video_durations_entry.pack(side="left", fill="x", expand=True)
+
+        # 2. 修改文案输入框的标签和提示文字
+        ctk.CTkLabel(tab, text="输入文案 (格式: 时长--文案, 用'/'换行, 用'&'分隔块):").pack(anchor="w", padx=10, pady=(10, 0))
+        self.video_text_input_box = ctk.CTkTextbox(tab, height=150)
+        # 添加新的示例文字到输入框
+        self.video_text_input_box.insert("1.0", "例如:\n5--这是主文案&这是次文案1\n7--这是第二个视频的文案")
+        self.video_text_input_box.pack(fill="x", padx=10, pady=(5,10), expand=True)
+        # --- 修改结束 ---
 
         group_frame = ctk.CTkFrame(tab, fg_color="transparent")
         group_frame.pack(fill="x", padx=10, pady=5)
@@ -7946,7 +7961,7 @@ class App(ctk.CTk):
         main_page_data = {
             'folder_path': self.video_folder_entry.get(),
             'output_path': self.video_output_folder_entry.get(),
-            'durations': self.video_durations_entry.get(),
+
             'text_input': self.video_text_input_box.get("1.0", "end-1c"),
             'num_groups': self.video_num_groups_entry.get(),
             'phone_serial': self.video_phone_serial_entry.get(),
@@ -9745,7 +9760,7 @@ class App(ctk.CTk):
                 'text_input': self.video_text_input_box.get("1.0", "end-1c"),
                 'num_groups': self.video_num_groups_entry.get(),
                 'phone_serial': self.video_phone_serial_entry.get(),
-                'durations': self.video_durations_entry.get(),
+
                 'use_gpu': self.video_use_gpu_switch.get(),
                 'random_remix': self.video_random_remix_switch.get(),
                 'shared_font_file': self.video_shared_font_file_entry.get(),
@@ -9998,7 +10013,6 @@ class App(ctk.CTk):
         _load_textbox('video_text_input_box', vs, 'text_input')
         _load_entry('video_num_groups_entry', vs, 'num_groups', '1')
         _load_entry('video_phone_serial_entry', vs, 'phone_serial')
-        _load_entry('video_durations_entry', vs, 'durations')
         _load_switch('video_use_gpu_switch', vs, 'use_gpu')
         _load_switch('video_random_remix_switch', vs, 'random_remix')
         _load_entry('video_shared_font_file_entry', vs, 'shared_font_file',
