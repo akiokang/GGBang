@@ -24,6 +24,7 @@ import struct
 import requests
 import subprocess
 import platform
+import tkinter as tk
 from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip, ColorClip, ImageClip, ImageSequenceClip
 from moviepy.video.fx import all as vfx
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageColor, ImageFilter # <--- 确保 ImageFilter 在这里
@@ -400,21 +401,21 @@ class App(ctk.CTk):
         self.porter_stop_event = threading.Event()
         self.img_to_video_stop_event = threading.Event()
         self.split_screen_stop_event = threading.Event()
+        self.metadata_writer_stop_event = threading.Event()
         self.ITV_PRESETS_FILE = get_persistent_settings_path("img_to_video_presets.json")
         # 注意：原代码中有一些重复的事件定义，这里已为您整合
         self.VIDEO_PRESETS_FILE = get_persistent_settings_path("video_presets.json")
         self.IMAGE_PRESETS_FILE = get_persistent_settings_path("image_presets.json")  # 新增: 图片处理的预设文件
         self.active_ffmpeg_process = None
-        try:
-            # cv2.data.haarcascades 会自动指向OpenCV库中存放模型文件的正确路径
-            cascade_path = os.path.join(cv2.data.haarcascades, 'haarcascade_frontalface_default.xml')
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            if self.face_cascade.empty():
-                print("警告: 人脸识别模型加载失败，'AI女巫'功能将不可用。")
-                self.face_cascade = None
-        except Exception as e:
-            self.face_cascade = None
-            print(f"加载人脸识别模型时出错: {e}")
+        self.face_cascade = None # <-- 只保留这一行
+
+    def _initialize_face_detector(self):
+        """在首次需要时，加载人脸识别模型。"""
+        if self.face_cascade is not None:  # 如果已经加载过，就直接返回
+            return
+
+        self.log_avatar("首次运行：正在加载人脸识别模型，请稍候...")
+
     def setup_main_ui(self):
         """ 这是一个新函数，包含了所有耗时的UI创建和设置工作 """
 
@@ -429,7 +430,7 @@ class App(ctk.CTk):
         self.main_tabview.add("视频")
         self.main_tabview.add("图文")
         self.main_tabview.add("NEWS")
-        self.main_tabview.add("AI美女/女巫")
+        self.main_tabview.add("工具")
         self.main_tabview.add("绿幕合成")
         self.main_tabview.add("卡秒")
         self.main_tabview.add("双屏")
@@ -462,7 +463,7 @@ class App(ctk.CTk):
     def setup_ai_workflow(self):
         """创建“AI美女/女巫”主标签，并在其中嵌入所有AI相关的子标签页"""
         # 1. 获取主标签页
-        ai_main_tab = self.main_tabview.tab("AI美女/女巫")
+        ai_main_tab = self.main_tabview.tab("工具")
 
         # 2. 在内部创建子菜单的 Tabview
         ai_sub_tabview = ctk.CTkTabview(ai_main_tab)
@@ -741,16 +742,200 @@ class App(ctk.CTk):
 
         # 3. 添加所有需要的子标签页
         video_sub_tabview.add("视频处理")
+        video_sub_tabview.add("写入元数据")
         video_sub_tabview.add("长视频分割")
         video_sub_tabview.add("统一分辨率")
         video_sub_tabview.add("加滤镜")
 
         # 4. 调用各个子功能的设置函数，并把对应的子标签页传递给它们
         self.setup_video_workflow(video_sub_tabview.tab("视频处理"))
+        self.setup_metadata_writer_workflow(video_sub_tabview.tab("写入元数据"))
         self.setup_video_splitter_workflow(video_sub_tabview.tab("长视频分割"))
         self.setup_uniform_resolution_workflow(video_sub_tabview.tab("统一分辨率"))
         self.setup_lut_workflow(video_sub_tabview.tab("加滤镜"))
 
+    # ==============================================================================
+    # --- 【新增功能】写入元数据 (从 3.py 整合) ---
+    # ==============================================================================
+    def setup_metadata_writer_workflow(self, parent_tab):
+        """创建“写入元数据”功能的UI界面"""
+        tab = parent_tab
+
+        # --- 元数据模板输入区 ---
+        meta_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        meta_frame.pack(fill="x", padx=10, pady=(5, 0))
+        ctk.CTkLabel(meta_frame, text="1. 粘贴元数据模板 (来自 ExifTool)", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=5)
+        self.meta_writer_template_textbox = ctk.CTkTextbox(meta_frame, wrap=tk.WORD, height=150)
+        self.meta_writer_template_textbox.pack(fill="x", expand=True, padx=5, pady=5)
+
+        # --- 路径选择区 ---
+        path_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        path_frame.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(path_frame, text="2. 设置路径", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=5)
+        self.create_folder_selection_row(path_frame, "待处理文件夹:", "选择包含视频的文件夹 (可含子文件夹)",
+                                         "meta_writer_input_folder_entry")
+        self.create_folder_selection_row(path_frame, "输出文件夹:", "选择处理结果的存放位置",
+                                         "meta_writer_output_folder_entry")
+
+        # --- 按钮区 ---
+        button_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        button_frame.pack(fill="x", padx=10, pady=15)
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.meta_writer_start_button = ctk.CTkButton(button_frame, text="开始写入元数据", height=40,
+                                                      command=self.start_metadata_writer_processing)
+        self.meta_writer_start_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.meta_writer_stop_button = ctk.CTkButton(button_frame, text="停止处理", height=40,
+                                                     command=self.stop_metadata_writer_processing, state="disabled",
+                                                     fg_color="red", hover_color="darkred")
+        self.meta_writer_stop_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+        # --- 日志区 ---
+        log_frame = ctk.CTkFrame(tab, fg_color="transparent")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        ctk.CTkLabel(log_frame, text="3. 运行日志", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=5)
+        self.meta_writer_log_textbox = ctk.CTkTextbox(log_frame, state="disabled", text_color="#A9A9A9")
+        self.meta_writer_log_textbox.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def log_meta_writer(self, message, clear=False):
+        """为新功能创建专用的日志记录器"""
+        self.after(0, self._update_log, self.meta_writer_log_textbox, message, clear)
+
+    def start_metadata_writer_processing(self):
+        self.metadata_writer_stop_event.clear()
+        self.meta_writer_start_button.configure(state="disabled")
+        self.meta_writer_stop_button.configure(state="normal")
+        self.log_meta_writer("处理开始...", clear=True)
+        threading.Thread(target=self.run_metadata_writer_logic, daemon=True).start()
+
+    def stop_metadata_writer_processing(self):
+        self.log_meta_writer("🔴 发送停止信号...请等待当前文件处理完毕。")
+        self.metadata_writer_stop_event.set()
+        self.meta_writer_stop_button.configure(state="disabled")
+
+    def _reset_metadata_writer_buttons(self):
+        self.meta_writer_start_button.configure(state="normal")
+        self.meta_writer_stop_button.configure(state="disabled")
+
+    def _parse_exiftool_output_to_args(self, text_data):
+        """(来自 3.py) 解析 ExifTool 的纯文本输出，并将其转换为命令行参数列表。"""
+        args = []
+        ignore_tags = [
+            'ExifTool Version Number', 'File Name', 'Directory', 'File Size',
+            'File Modification Date/Time', 'File Access Date/Time', 'File Creation Date/Time',
+            'File Permissions', 'Warning', 'MIME Type', 'File Type', 'File Type Extension',
+            'XMP Toolkit'
+        ]
+
+        for line in text_data.strip().split('\n'):
+            if ':' in line:
+                parts = line.split(':', 1)
+                key = parts[0].strip()
+                value = parts[1].strip()
+
+                if key and value and key not in ignore_tags:
+                    arg_key = key.replace(' ', '')
+                    args.append(f'-{arg_key}={value}')
+        return args
+
+    def run_metadata_writer_logic(self):
+        """【v4.0 简化版】只执行高速无损复制，不进行任何旋转处理。"""
+        try:
+            meta_template_text = self.meta_writer_template_textbox.get("1.0", "end-1c")
+            input_folder = self.meta_writer_input_folder_entry.get()
+            output_folder = self.meta_writer_output_folder_entry.get()
+
+            if not meta_template_text.strip() or not input_folder or not output_folder:
+                self.log_meta_writer("❌ 错误: 元数据模板、待处理文件夹和输出文件夹都必须填写！")
+                return
+
+            ffmpeg_path = self._find_executable("ffmpeg")
+            exiftool_path = self._find_executable("exiftool")
+            if not ffmpeg_path or not exiftool_path:
+                self.log_meta_writer("❌ 致命错误: 找不到 'ffmpeg' 或 'exiftool'。请确保它们已正确安装。")
+                return
+
+            self.log_meta_writer("✅ FFMpeg 和 ExifTool 环境检查通过。")
+            self.log_meta_writer("--- 正在解析元数据模板 ---")
+            meta_args = self._parse_exiftool_output_to_args(meta_template_text)
+            if not meta_args:
+                self.log_meta_writer("❌ 错误: 未能从模板中解析出任何有效的元数据，请检查粘贴的内容。")
+                return
+            self.log_meta_writer(f"✅ 模板解析成功，将应用 {len(meta_args)} 个元数据标签。")
+
+            video_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.wmv')
+            videos_to_process = [os.path.join(r, f) for r, d, fs in os.walk(input_folder) for f in fs if
+                                 f.lower().endswith(video_extensions)]
+
+            if not videos_to_process:
+                self.log_meta_writer("🟡 警告: 在待处理文件夹中未找到任何视频文件。")
+                return
+
+            self.log_meta_writer(f"--- 扫描完成，共找到 {len(videos_to_process)} 个视频文件待处理 ---")
+
+            total_files = len(videos_to_process)
+            for i, input_path in enumerate(videos_to_process):
+                if self.metadata_writer_stop_event.is_set():
+                    self.log_meta_writer("🔴 任务已中止。")
+                    break
+
+                self.log_meta_writer(
+                    f"\n--- 正在处理第 {i + 1}/{total_files} 个文件: {os.path.basename(input_path)} ---")
+
+                relative_path = os.path.relpath(os.path.dirname(input_path), input_folder)
+                final_output_dir = os.path.join(output_folder, relative_path)
+                os.makedirs(final_output_dir, exist_ok=True)
+
+                base_name, _ = os.path.splitext(os.path.basename(input_path))
+                final_output_path = os.path.join(final_output_dir, f"{base_name}_meta.mov")
+                temp_mp4_path = os.path.join(final_output_dir, f"{base_name}_temp_{i}.mp4")
+
+                try:
+                    self.log_meta_writer("  - 步骤 A: 复制源文件...")
+                    shutil.copy2(input_path, temp_mp4_path)
+
+                    self.log_meta_writer("  - 步骤 B: 使用 ExifTool 写入模板元数据...")
+                    exiftool_cmd = [exiftool_path, "-overwrite_original", "-api", "largefilesupport=1"] + meta_args + [
+                        temp_mp4_path]
+
+                    creation_flags = 0
+                    if sys.platform == 'win32': creation_flags = subprocess.CREATE_NO_WINDOW
+                    subprocess.run(exiftool_cmd, check=True, capture_output=True, creationflags=creation_flags)
+
+                    # --- vvvvvv 核心修改：移除所有旋转判断，只保留高速复制 vvvvvv ---
+                    self.log_meta_writer("  - 步骤 C: 使用高速无损复制模式生成最终文件...")
+                    ffmpeg_cmd = [
+                        ffmpeg_path,
+                        "-i", temp_mp4_path,
+                        "-c", "copy",
+                        "-map_metadata", "0",
+                        "-y", final_output_path
+                    ]
+                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True, creationflags=creation_flags)
+                    # --- ^^^^^^ 核心修改结束 ^^^^^^ ---
+
+                    self.log_meta_writer(f"  ✅ 成功！输出文件: {final_output_path}")
+
+                except subprocess.CalledProcessError as e:
+                    self.log_meta_writer(f"  ❌ 处理失败！")
+                    self.log_meta_writer("  --- 错误详情 ---")
+                    self.log_meta_writer(e.stderr.decode('utf-8', errors='ignore'))
+                except Exception as e:
+                    self.log_meta_writer(f"  ❌ 发生未知错误: {e}")
+                finally:
+                    if os.path.exists(temp_mp4_path):
+                        os.remove(temp_mp4_path)
+
+            if not self.metadata_writer_stop_event.is_set():
+                self.log_meta_writer("\n🎉🎉🎉 全部任务处理完毕！ 🎉🎉🎉")
+
+        except Exception as e:
+            self.log_meta_writer(f"发生未预料的严重错误: {e}")
+            self.log_meta_writer(traceback.format_exc())
+        finally:
+            self.after(0, self._reset_metadata_writer_buttons)
     # ==============================================================================
     # --- 图文总菜单 (新) ---
     # ==============================================================================
@@ -1943,154 +2128,7 @@ class App(ctk.CTk):
     # ==============================================================================
 
 
-    def log_avatar(self, message, clear=False):
-        self.after(0, self._update_log, self.avatar_log_textbox, message, clear)
 
-    def start_avatar_processing(self):
-        self.avatar_stop_event.clear()
-        self.avatar_start_button.configure(state="disabled")
-        self.avatar_stop_button.configure(state="normal")
-        self.log_avatar("开始处理...", clear=True)
-        threading.Thread(target=self.run_avatar_logic, daemon=True).start()
-
-    def stop_avatar_processing(self):
-        self.log_avatar("🔴 发送立即中止信号...")
-        self.avatar_stop_event.set()  # 仍然设置事件，以停止Python端的循环
-
-        # 检查是否存在正在运行的FFmpeg进程
-        if self.active_ffmpeg_process:
-            try:
-                self.log_avatar("  -> 正在强制终止FFmpeg子进程...")
-                self.active_ffmpeg_process.kill()  # kill()会立即终止进程
-                self.log_avatar("  -> FFmpeg进程已终止。")
-            except Exception as e:
-                self.log_avatar(f"  -> 终止进程时出错: {e}")
-
-        self.avatar_stop_button.configure(state="disabled")
-
-    def _reset_avatar_buttons(self):
-        self.avatar_start_button.configure(state="normal")
-        self.avatar_stop_button.configure(state="disabled")
-
-    def _avatar_worker(self, input_path, output_path, zoom, mirror, contrast, brightness, saturation, use_gpu):
-        """【最终修正版】使用OpenCV识别人脸，并用FFmpeg管道进行处理 (增加GPU编码选项)"""
-        cap = None
-        proc = None
-        try:
-            cap = cv2.VideoCapture(input_path)
-            if not cap.isOpened():
-                self.log_avatar(f"警告：无法打开 '{os.path.basename(input_path)}'")
-                return False
-
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            aspect_ratio = frame_width / frame_height
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps == 0: fps = 25
-
-            ret, first_frame = cap.read()
-            if not ret:
-                self.log_avatar(f"警告：无法读取 '{os.path.basename(input_path)}' 的第一帧")
-                return False
-
-            gray_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
-            if self.face_cascade:
-                faces = self.face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=7,
-                                                           minSize=(50, 50))
-            else:
-                faces = []
-
-            if len(faces) == 0:
-                self.log_avatar(f"警告：在 '{os.path.basename(input_path)}' 第一帧未检测到人脸，跳过此视频。")
-                return False
-
-            fx, fy, fw, fh = faces[0]
-            face_center_x, face_center_y = fx + fw // 2, fy + fh // 2
-            crop_h = int(fh * zoom)
-            crop_w = int(crop_h * aspect_ratio)
-            crop_w, crop_h = min(crop_w, frame_width), min(crop_h, frame_height)
-            x1 = max(0, face_center_x - crop_w // 2)
-            y1 = max(0, face_center_y - crop_h // 2)
-            x2, y2 = x1 + crop_w, y1 + crop_h
-            if x2 > frame_width: x1 -= (x2 - frame_width)
-            if y2 > frame_height: y1 -= (y2 - frame_height)
-            x1, y1 = max(0, x1), max(0, y1)
-            crop_w = min(crop_w, frame_width - x1)
-            crop_h = min(crop_h, frame_height - y1)
-
-            self.log_avatar(f"  -> 定位到人脸，应用等比裁剪区域: x={x1}, y={y1}, w={crop_w}, h={crop_h}")
-
-            filters = []
-            if mirror:
-                filters.append("hflip")
-            filters.append(f"eq=contrast={contrast}:brightness={brightness}:saturation={saturation}")
-            filter_str = ",".join(filters)
-
-            ffmpeg_path = self._find_executable('ffmpeg')
-
-            # --- 核心修改：根据use_gpu选择编码器 ---
-            video_codec = 'h264_nvenc' if use_gpu else 'libx264'
-            preset = 'fast' if use_gpu else 'medium'
-            self.log_avatar(f"  -> 将使用 {('GPU' if use_gpu else 'CPU')} 的 {video_codec} 编码器。")
-            # --- 修改结束 ---
-
-            command = [
-                ffmpeg_path, '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-                '-s', f'{frame_width}x{frame_height}', '-pix_fmt', 'bgr24',
-                '-r', str(fps), '-i', '-', '-i', os.path.normpath(input_path),
-                '-filter_complex', f"[0:v]{filter_str}[v_out]",
-                '-map', '[v_out]', '-map', '1:a?',
-                '-c:v', video_codec,  # 使用选择的编码器
-                '-c:a', 'copy',
-                '-preset', preset,
-                '-crf' if not use_gpu else '-cq', '23',  # CRF用于CPU, CQ用于GPU
-                os.path.normpath(output_path)
-            ]
-
-            creation_flags = 0
-            if sys.platform == 'win32':
-                creation_flags = subprocess.CREATE_NO_WINDOW
-            self.active_ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, creationflags=creation_flags,
-                                                          stderr=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            proc = self.active_ffmpeg_process
-            self.log_avatar(f"  -> 正在逐帧处理并写入文件...")
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            for i in range(frame_count):
-                if self.avatar_stop_event.is_set(): break
-                ret, frame = cap.read()
-                if not ret: break
-                cropped = frame[y1:y1 + crop_h, x1:x1 + crop_w]
-                resized = cv2.resize(cropped, (frame_width, frame_height), interpolation=cv2.INTER_LANCZOS4)
-                try:
-                    proc.stdin.write(resized.tobytes())
-                except (IOError, BrokenPipeError):
-                    self.log_avatar("  -> FFmpeg进程提前关闭，停止写入。")
-                    break
-
-            self.log_avatar(f"  -> 视频帧写入完成，等待FFmpeg结束编码...")
-            stdout_data, stderr_data = proc.communicate()
-
-            if proc.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    returncode=proc.returncode,
-                    cmd=command,
-                    stderr=stderr_data.decode('utf-8', errors='ignore') if stderr_data else "No stderr output."
-                )
-
-            return True
-        except subprocess.CalledProcessError as e:
-            self.log_avatar(f"  ❌ FFmpeg 处理失败: {os.path.basename(input_path)}")
-            self.log_avatar(f"     FFmpeg错误: {e.stderr.strip()}")
-            return False
-        except Exception as e:
-            self.log_avatar(f"  ❌ 处理时发生未知错误: {e}")
-            return False
-        finally:
-            if cap: cap.release()
-            self.active_ffmpeg_process = None
 
     # ==============================================================================
     # --- 【新增功能】羽化拼接 ---
@@ -3429,7 +3467,9 @@ class App(ctk.CTk):
 
     def run_video_logic_hybrid(self):
         """
-        【v2.4 时长前置版】支持视频和图片作为输入源, 并从每行文案前缀解析时长。
+        【v2.5 双模式时长统一版】
+        - 简单模式和复杂模式都支持 时长--文案 格式。
+        - 简单模式下如果未提供时长，则使用视频原始时长。
         """
         try:
             # --- 1. 获取所有UI输入和配置 ---
@@ -3441,18 +3481,12 @@ class App(ctk.CTk):
             output_folder = self.video_output_folder_entry.get()
             all_input_text = self.video_text_input_box.get("1.0", "end-1c")
 
-            # --- 【核心修改点】---
-            # 1. 移除旧的时长读取逻辑
-            # durations_str = self.video_durations_entry.get()
-            # duration_instructions = self._parse_duration_string(durations_str)
-
-            # 2. 解析新的 "时长--文案" 格式
+            # --- 解析 "时长--文案" 格式 ---
             raw_text_lines = [line.strip() for line in all_input_text.splitlines() if
                               line.strip() and "例如:" not in line]
 
             text_lines = []
             duration_instructions = []
-            is_duration_specified = False
 
             self.log_video("--- 开始解析文案与时长 ---")
             for i, line in enumerate(raw_text_lines):
@@ -3461,31 +3495,23 @@ class App(ctk.CTk):
                     duration_str = parts[0].strip()
                     caption = parts[1].strip()
                     try:
-                        # 尝试将前缀转换为浮点数时长
                         duration = float(duration_str)
                         if duration <= 0:
                             self.log_video(f"  -> 警告: 第 {i + 1} 行的时长 '{duration_str}' 无效，将使用视频默认时长。")
-                            duration_instructions.append(None)  # 时长无效
+                            duration_instructions.append(None)
                         else:
-                            # 这里我们只处理简单时长，混剪模式的复杂时长(5-4-3)由worker内部处理
                             duration_instructions.append(duration)
-                            is_duration_specified = True
                         text_lines.append(caption)
                         self.log_video(f"  -> 第 {i + 1} 行: 解析到时长 {duration:.2f}s, 文案: '{caption[:20]}...'")
                     except ValueError:
                         self.log_video(
-                            f"  -> 警告: 第 {i + 1} 行的时长前缀 '{duration_str}' 不是有效数字，将整行视为文案。")
-                        duration_instructions.append(None)  # 没有有效时长
-                        text_lines.append(line)  # 整行都是文案
+                            f"  -> 警告: 第 {i + 1} 行的时长前缀 '{duration_str}' 不是有效数字，将整行视为文案，并使用视频默认时长。")
+                        duration_instructions.append(None)
+                        text_lines.append(line)
                 else:
-                    # 如果没有'--'分隔符，则认为没有指定时长
                     duration_instructions.append(None)
                     text_lines.append(line)
-                    self.log_video(f"  -> 第 {i + 1} 行: 未指定时长, 文案: '{line[:20]}...'")
-
-            # 3. 移除旧的验证逻辑, 因为新逻辑确保了两个列表长度一致
-            # if is_duration_specified and len(text_lines) != len(duration_instructions): ...
-            # --- 修改结束 ---
+                    self.log_video(f"  -> 第 {i + 1} 行: 未指定时长, 将使用视频默认时长。文案: '{line[:20]}...'")
 
             if not text_lines:
                 self.log_video("错误: 有效文案为空。");
@@ -3544,7 +3570,6 @@ class App(ctk.CTk):
                         self.video_stop_event.set();
                         break
 
-                    # 获取当前任务对应的时长
                     duration_instruction = duration_instructions[j]
                     output_name = f"{group_name}_{j + 1}.mp4"
 
@@ -3571,6 +3596,15 @@ class App(ctk.CTk):
 
             if not self.video_stop_event.is_set():
                 self.log_video("\n---=== 所有任务处理完毕！ ===---")
+                final_output_folder = self.video_output_folder_entry.get()
+                if final_output_folder and os.path.isdir(final_output_folder) and hasattr(self,
+                                                                                          'meta_writer_input_folder_entry'):
+                    def sync_path():
+                        self.meta_writer_input_folder_entry.delete(0, "end")
+                        self.meta_writer_input_folder_entry.insert(0, final_output_folder)
+                        self.log_video("✅ 路径已自动同步到 '写入元数据' 标签页的待处理文件夹中。")
+                    self.after(0, sync_path)
+
         except Exception as e:
             self.log_video(f"发生未预料的严重错误: {e}")
             traceback.print_exc()
@@ -3634,9 +3668,8 @@ class App(ctk.CTk):
     def _apply_text_and_remix_worker(self, media_pool, group_folder, video_name, text_line, config, use_gpu,
                                      duration_instruction):
         """
-        【v2.11 媒体兼容版】
-        - 能够处理视频或图片作为输入。
-        - 如果输入是图片，会根据时长配置将其转换为临时视频。
+        【v2.14 健壮性修复版】
+        - 修复了在无有效文案时 'filter_complex_string' 未定义的错误。
         """
         temp_files_to_delete = []
         original_media_used = []
@@ -3644,17 +3677,20 @@ class App(ctk.CTk):
         IMAGE_EXT = ('.png', '.jpg', '.jpeg', '.webp')
 
         try:
-            base_video_path = None
+            final_duration = 0
+            if isinstance(duration_instruction, dict):
+                final_duration = duration_instruction.get('total', 0)
+            elif isinstance(duration_instruction, (int, float)):
+                final_duration = duration_instruction
 
+            base_video_path = None
             is_complex_duration = isinstance(duration_instruction, dict)
             is_simple_remix = is_remix_on and isinstance(duration_instruction, (int, float))
 
             if is_complex_duration or is_simple_remix:
-                # --- 混剪模式 ---
-                total_duration = duration_instruction['total'] if is_complex_duration else duration_instruction
+                total_duration = final_duration
                 log_msg = f"\n- [混剪模式] 正在创建总长 {total_duration:.2f}s 的混剪视频"
                 self.log_video(log_msg)
-
                 remix_video_path, temp_files, used_originals = self._create_random_remix_clip(
                     total_duration, media_pool, group_folder, self.log_video
                 )
@@ -3663,31 +3699,16 @@ class App(ctk.CTk):
                 temp_files_to_delete.extend(temp_files)
                 original_media_used.extend(used_originals)
             else:
-                # --- 单文件模式 ---
                 self.log_video(f"\n- [单文件模式] 正在处理...")
-
                 selected_media_path = media_pool[0]
                 original_media_used.append(selected_media_path)
-
                 if selected_media_path.lower().endswith(IMAGE_EXT):
-                    # 如果是图片，执行转换
                     self.log_video(f"  -> 检测到图片文件: {os.path.basename(selected_media_path)}，将转换为视频...")
-
-                    target_duration = 5.0
-                    if isinstance(duration_instruction, dict):
-                        target_duration = duration_instruction.get('total', 5.0)
-                    elif isinstance(duration_instruction, (int, float)):
-                        target_duration = duration_instruction
-
+                    target_duration = final_duration if final_duration > 0 else 5.0
                     temp_video_from_image_path = os.path.join(group_folder,
                                                               f"temp_vid_{random.randint(1000, 9999)}.mp4")
-
-                    success = self._create_video_from_image(
-                        selected_media_path,
-                        target_duration,
-                        temp_video_from_image_path
-                    )
-
+                    success = self._create_video_from_image(selected_media_path, target_duration,
+                                                            temp_video_from_image_path)
                     if success:
                         self.log_video(f"  -> ✅ 图片成功转换为 {target_duration:.2f}s 视频。")
                         base_video_path = temp_video_from_image_path
@@ -3695,14 +3716,11 @@ class App(ctk.CTk):
                     else:
                         raise RuntimeError("图片转视频失败，跳过此任务。")
                 else:
-                    # 如果是视频，直接使用
                     base_video_path = selected_media_path
 
-            # --- 片头拼接逻辑 (保持不变) ---
             try:
                 video_folder = self.video_folder_entry.get()
                 intro_subfolder_path = os.path.join(video_folder, "1")
-
                 if os.path.isdir(intro_subfolder_path):
                     intro_videos = [f for f in os.listdir(intro_subfolder_path) if
                                     f.lower().endswith(('.mp4', '.mov', '.avi'))]
@@ -3719,8 +3737,8 @@ class App(ctk.CTk):
                                                                   temp_concatenated_path, use_gpu)
                             if success:
                                 self.log_video("  -> ✅ 片头拼接成功。")
-                                if base_video_path not in original_media_used:
-                                    temp_files_to_delete.append(base_video_path)
+                                if base_video_path not in original_media_used: temp_files_to_delete.append(
+                                    base_video_path)
                                 base_video_path = temp_concatenated_path
                                 temp_files_to_delete.append(temp_concatenated_path)
                             else:
@@ -3732,93 +3750,116 @@ class App(ctk.CTk):
             except Exception as e:
                 self.log_video(f"  -> 警告: 在处理片头逻辑时发生意外错误: {e}")
 
-            # --- 后续的文字叠加和FFmpeg合成逻辑保持不变 ---
             self.log_video("  -> 步骤1: 解析文案并生成独立图层...")
             overlay_layers = []
 
-            if '&' in text_line:
+            if self.video_simple_subtext_switch.get() == 1:
+                self.log_video("    -> [模式] 简单次文案模式已启用。")
                 parts = text_line.split('&', 1)
-                main_text, sub_text_block = parts[0].strip(), parts[1].strip()
+                main_text = parts[0].strip()
+                sub_text = parts[1].strip() if len(parts) > 1 else None
+                if main_text:
+                    main_config = config['主文案']
+                    main_img = self._render_text_block_as_pillow(main_text, config['共享样式'], main_config,
+                                                                 (1080, 1920))
+                    overlay_layers.append({'image': main_img, 'config': main_config, 'start': 0, 'end': -1})
+                if sub_text:
+                    sub_config_1 = config.get('次文案', [{}])[0]
+                    sub_img = self._render_text_block_as_pillow(sub_text, config['共享样式'], sub_config_1,
+                                                                (1080, 1920))
+                    overlay_layers.append({'image': sub_img, 'config': sub_config_1, 'start': 0, 'end': -1})
             else:
-                main_text, sub_text_block = text_line.strip(), ""
-
-            if main_text:
-                main_config = config['主文案']
-                main_img = self._render_text_block_as_pillow(main_text, config['共享样式'], main_config, (1080, 1920))
-                overlay_layers.append({'image': main_img, 'config': main_config, 'start': 0, 'end': -1})
-
-            if sub_text_block:
-                sub_texts, sub_configs_list, duration_parts = sub_text_block.split('-'), config.get('次文案', []), []
-
-                if is_complex_duration:
-                    duration_parts = duration_instruction['parts']
-                elif isinstance(duration_instruction, (int, float)):
-                    total_sub_duration = duration_instruction
-                    if len(sub_texts) > 0:
-                        duration_per_part = total_sub_duration / len(sub_texts)
-                        duration_parts = [duration_per_part] * len(sub_texts)
-
-                if not sub_configs_list:
-                    self.log_video("  -> 警告：文案中存在'&'但未配置任何次文案样式，已忽略。")
-                elif not duration_parts:
-                    self.log_video("  -> 警告：存在次文案，但未指定有效时长，已忽略。")
+                self.log_video("    -> [模式] 分段定时次文案模式已启用。")
+                if '&' in text_line:
+                    parts = text_line.split('&', 1)
+                    main_text, sub_text_block = parts[0].strip(), parts[1].strip()
                 else:
-                    sub_config_1 = sub_configs_list[0]
-                    current_time = 0
-                    num_parts_to_process = min(len(sub_texts), len(duration_parts))
-                    for i in range(num_parts_to_process):
-                        sub_text, part_duration = sub_texts[i], duration_parts[i]
-                        sub_img = self._render_text_block_as_pillow(sub_text.strip(), config['共享样式'], sub_config_1,
-                                                                    (1080, 1920))
-                        overlay_layers.append({'image': sub_img, 'config': sub_config_1, 'start': current_time,
-                                               'end': current_time + part_duration})
-                        current_time += part_duration
+                    main_text, sub_text_block = text_line.strip(), ""
+                if main_text:
+                    main_config = config['主文案']
+                    main_img = self._render_text_block_as_pillow(main_text, config['共享样式'], main_config,
+                                                                 (1080, 1920))
+                    overlay_layers.append({'image': main_img, 'config': main_config, 'start': 0, 'end': -1})
+                if sub_text_block:
+                    sub_texts, sub_configs_list, duration_parts = sub_text_block.split('-'), config.get('次文案',
+                                                                                                        []), []
+                    if is_complex_duration:
+                        duration_parts = duration_instruction['parts']
+                    elif isinstance(duration_instruction, (int, float)):
+                        total_sub_duration = duration_instruction
+                        if len(sub_texts) > 0:
+                            duration_per_part = total_sub_duration / len(sub_texts)
+                            duration_parts = [duration_per_part] * len(sub_texts)
+                    if not sub_configs_list:
+                        self.log_video("  -> 警告：文案中存在'&'但未配置任何次文案样式，已忽略。")
+                    elif not duration_parts:
+                        self.log_video("  -> 警告：存在次文案，但未指定有效时长，已忽略。")
+                    else:
+                        sub_config_1 = sub_configs_list[0]
+                        current_time = 0
+                        num_parts_to_process = min(len(sub_texts), len(duration_parts))
+                        for i in range(num_parts_to_process):
+                            sub_text, part_duration = sub_texts[i], duration_parts[i]
+                            sub_img = self._render_text_block_as_pillow(sub_text.strip(), config['共享样式'],
+                                                                        sub_config_1, (1080, 1920))
+                            overlay_layers.append({'image': sub_img, 'config': sub_config_1, 'start': current_time,
+                                                   'end': current_time + part_duration})
+                            current_time += part_duration
 
             corrected_video_path, temp_file = self._preprocess_video_orientation(base_video_path, group_folder,
                                                                                  self.log_video)
             if temp_file: temp_files_to_delete.append(temp_file)
             if not corrected_video_path: raise RuntimeError("视频预处理失败。")
 
-            for i, layer in enumerate(overlay_layers):
-                png_path = os.path.join(group_folder, f"layer_{i}_{random.randint(1000, 9999)}.png")
-                layer['image'].save(png_path, 'PNG')
-                layer['path'] = png_path
-                temp_files_to_delete.append(png_path)
-
+            # vvvvvvvvvv 【核心修复逻辑】 vvvvvvvvvv
             self.log_video("  -> 步骤2: 构建FFmpeg动态图层命令...")
             output_video_path = os.path.join(group_folder, f"processed_{os.path.splitext(video_name)[0]}.mp4")
-
-            ffmpeg_inputs = [f'-i "{os.path.normpath(corrected_video_path)}"']
-            for layer in overlay_layers: ffmpeg_inputs.append(f'-i "{os.path.normpath(layer["path"])}"')
-
-            filter_chains, last_stream, main_text_y_pos, main_text_height = [], "[0:v]", 0, 0
-            for k, layer in enumerate(overlay_layers):
-                input_stream = f"[{k + 1}:v]"
-                output_tag = "[v_out]" if k == len(overlay_layers) - 1 else f"[v{k + 1}]"
-                if k == 0:
-                    pos_config = layer['config']['位置']
-                    x_pos_val, y_pos = pos_config['水平位置 (x)'], pos_config['垂直位置 (y)']
-                    x_pos = "(W-w)/2" if str(x_pos_val) == 'center' else str(x_pos_val)
-                    main_text_y_pos, main_text_height = y_pos, layer['image'].height
-                else:
-                    x_pos, y_offset = "(W-w)/2", layer['config']['相对Y轴偏移']
-                    y_pos = main_text_y_pos + main_text_height + y_offset
-
-                time_filter = f":enable='between(t,{layer['start']},{layer['end']})'" if layer['end'] != -1 else ""
-                filter_chains.append(f"{last_stream}{input_stream}overlay={x_pos}:{y_pos}{time_filter}{output_tag}")
-                last_stream = output_tag
-
-            filter_complex_string = ";".join(filter_chains)
-            final_duration = duration_instruction['total'] if is_complex_duration else (
-                duration_instruction if is_simple_remix else 0)
             duration_param = f"-to {final_duration}" if final_duration > 0 else ""
-
             output_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
             safe_ffmpeg_path = f'"{os.path.normpath(self._find_executable("ffmpeg"))}"'
-            command_string = (
-                f'{safe_ffmpeg_path} -y {" ".join(ffmpeg_inputs)} {duration_param} -filter_complex "{filter_complex_string}" '
-                f'-map "[v_out]" -map 0:a? -c:v {output_codec} -preset fast -pix_fmt yuv420p '
-                f'-c:a aac -b:a 192k -movflags +faststart "{os.path.normpath(output_video_path)}"')
+            command_string = ""
+
+            if not overlay_layers:
+                # 如果没有任何文字图层，则执行一个简单的命令（只处理时长裁剪和转码）
+                self.log_video("    -> 未检测到有效文案，仅处理视频（如裁剪时长）。")
+                safe_corrected_video_path = f'"{os.path.normpath(corrected_video_path)}"'
+                command_string = (f'{safe_ffmpeg_path} -y -i {safe_corrected_video_path} {duration_param} '
+                                  f'-c:v {output_codec} -preset fast -pix_fmt yuv420p '
+                                  f'-c:a copy -movflags +faststart "{os.path.normpath(output_video_path)}"')
+            else:
+                # 如果有文字图层，则执行复杂的滤镜命令
+                for i, layer in enumerate(overlay_layers):
+                    png_path = os.path.join(group_folder, f"layer_{i}_{random.randint(1000, 9999)}.png")
+                    layer['image'].save(png_path, 'PNG')
+                    layer['path'] = png_path
+                    temp_files_to_delete.append(png_path)
+
+                ffmpeg_inputs = [f'-i "{os.path.normpath(corrected_video_path)}"']
+                for layer in overlay_layers: ffmpeg_inputs.append(f'-i "{os.path.normpath(layer["path"])}"')
+
+                filter_chains, last_stream, main_text_y_pos, main_text_height = [], "[0:v]", 0, 0
+                for k, layer in enumerate(overlay_layers):
+                    input_stream = f"[{k + 1}:v]"
+                    output_tag = "[v_out]" if k == len(overlay_layers) - 1 else f"[v{k + 1}]"
+                    if k == 0:
+                        pos_config = layer['config']['位置']
+                        x_pos_val, y_pos = pos_config['水平位置 (x)'], pos_config['垂直位置 (y)']
+                        x_pos = "(W-w)/2" if str(x_pos_val) == 'center' else str(x_pos_val)
+                        main_text_y_pos, main_text_height = y_pos, layer['image'].height
+                    else:
+                        x_pos, y_offset = "(W-w)/2", layer['config']['相对Y轴偏移']
+                        y_pos = main_text_y_pos + main_text_height + y_offset
+                    time_filter = f":enable='between(t,{layer['start']},{layer['end']})'" if layer['end'] != -1 else ""
+                    filter_chains.append(f"{last_stream}{input_stream}overlay={x_pos}:{y_pos}{time_filter}{output_tag}")
+                    last_stream = output_tag
+
+                filter_complex_string = ";".join(filter_chains)
+
+                command_string = (
+                    f'{safe_ffmpeg_path} -y {" ".join(ffmpeg_inputs)} {duration_param} -filter_complex "{filter_complex_string}" '
+                    f'-map "[v_out]" -map 0:a? -c:v {output_codec} -preset fast -pix_fmt yuv420p '
+                    f'-c:a aac -b:a 192k -movflags +faststart "{os.path.normpath(output_video_path)}"')
+            # ^^^^^^^^^^ 【核心修复逻辑结束】 ^^^^^^^^^^
 
             self.log_video(f"  -> 步骤3: 使用FFmpeg高速合成...");
             creation_flags = 0
@@ -5518,27 +5559,34 @@ class App(ctk.CTk):
     def _reset_video_clone_buttons(self):
         self.clone_start_button.configure(state="normal")
         self.clone_stop_button.configure(state="disabled")
+
     def _find_executable(self, name):
-        """查找 ffmpeg 或 ffprobe 的路径"""
+        """【修复版】智能查找可执行文件的路径，兼容打包后的环境"""
         executable_name = f"{name}.exe" if sys.platform.startswith("win") else name
+        base_path = ""
 
-        # 检查程序打包路径
+        # 确定搜索的根目录 (打包后是_MEIPASS，开发时是脚本目录)
         if getattr(sys, "frozen", False) and hasattr(sys, '_MEIPASS'):
-            local_path = os.path.join(sys._MEIPASS, "ffmpeg", executable_name)
-            if os.path.isfile(local_path):
-                return local_path
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
 
-        # 检查开发环境相对路径
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        local_path = os.path.join(current_dir, "ffmpeg", executable_name)
-        if os.path.isfile(local_path):
-            return local_path
+        # 1. 优先在根目录下查找 (用于 exiftool.exe)
+        root_path = os.path.join(base_path, executable_name)
+        if os.path.isfile(root_path):
+            return root_path
 
-        # 检查系统 PATH
+        # 2. 其次在 'ffmpeg' 子目录下查找 (用于 ffmpeg.exe, ffprobe.exe)
+        ffmpeg_subdir_path = os.path.join(base_path, "ffmpeg", executable_name)
+        if os.path.isfile(ffmpeg_subdir_path):
+            return ffmpeg_subdir_path
+
+        # 3. 最后在系统 PATH 环境变量中查找
         system_path = shutil.which(executable_name)
         if system_path:
             return system_path
 
+        # 如果都找不到，返回 None
         return None
     def run_video_clone_logic(self):
         try:
@@ -7533,7 +7581,11 @@ class App(ctk.CTk):
 
         self.video_random_remix_switch = ctk.CTkSwitch(switches_frame, text="随机混剪模式")
         self.video_random_remix_switch.grid(row=0, column=0, sticky="w", padx=(0, 20))
-
+        # vvvvvvvvvv 【新增代码】 vvvvvvvvvv
+        self.video_simple_subtext_switch = ctk.CTkSwitch(switches_frame, text="启用简单次文案模式 (&后为单行次文案)")
+        self.video_simple_subtext_switch.grid(row=0, column=1, sticky="w", padx=(0, 20))
+        self.video_simple_subtext_switch.select()  # 默认开启
+        # ^^^^^^^^^^ 【新增代码结束】 ^^^^^^^^^^
         self.video_use_gpu_switch = ctk.CTkSwitch(tab, text="使用GPU加速编码 (需NVIDIA显卡)"); self.video_use_gpu_switch.pack(anchor="w", padx=10, pady=5)
         button_frame = ctk.CTkFrame(tab, fg_color="transparent"); button_frame.pack(fill="x", padx=10, pady=10); button_frame.grid_columnconfigure((0,1), weight=1)
         self.start_video_button = ctk.CTkButton(button_frame, text="开始处理视频", height=40, command=self.start_video_processing_hybrid); self.start_video_button.grid(row=0, column=0, padx=(0,5), sticky="ew")
@@ -9760,7 +9812,7 @@ class App(ctk.CTk):
                 'text_input': self.video_text_input_box.get("1.0", "end-1c"),
                 'num_groups': self.video_num_groups_entry.get(),
                 'phone_serial': self.video_phone_serial_entry.get(),
-
+                'simple_subtext_mode': self.video_simple_subtext_switch.get(),
                 'use_gpu': self.video_use_gpu_switch.get(),
                 'random_remix': self.video_random_remix_switch.get(),
                 'shared_font_file': self.video_shared_font_file_entry.get(),
@@ -9946,6 +9998,13 @@ class App(ctk.CTk):
                 'num_groups': self.health_num_groups_entry.get(),
                 'phone_serial': self.health_phone_serial_entry.get(),
             },
+            # --- 新增：保存“写入元数据”的配置 ---
+            'metadata_writer_settings': {
+                'template': self.meta_writer_template_textbox.get("1.0", "end-1c"),
+                'input_folder': self.meta_writer_input_folder_entry.get(),
+                'output_folder': self.meta_writer_output_folder_entry.get()
+            },
+            # --- 新增结束 ---
         }
         try:
             with open(self.SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -10013,6 +10072,9 @@ class App(ctk.CTk):
         _load_textbox('video_text_input_box', vs, 'text_input')
         _load_entry('video_num_groups_entry', vs, 'num_groups', '1')
         _load_entry('video_phone_serial_entry', vs, 'phone_serial')
+        _load_switch('video_simple_subtext_switch', vs, 'simple_subtext_mode', True)
+
+        _load_switch('video_simple_subtext_switch', vs, 'simple_subtext_mode')
         _load_switch('video_use_gpu_switch', vs, 'use_gpu')
         _load_switch('video_random_remix_switch', vs, 'random_remix')
         _load_entry('video_shared_font_file_entry', vs, 'shared_font_file',
@@ -10189,6 +10251,12 @@ class App(ctk.CTk):
         _load_textbox('health_text_input_box', health_s, 'text_input')
         _load_entry('health_num_groups_entry', health_s, 'num_groups', '1')
         _load_entry('health_phone_serial_entry', health_s, 'phone_serial')
+        # --- 新增：加载“写入元数据”的配置 ---
+        mw_s = settings.get('metadata_writer_settings', {})
+        _load_textbox('meta_writer_template_textbox', mw_s, 'template')
+        _load_entry('meta_writer_input_folder_entry', mw_s, 'input_folder')
+        _load_entry('meta_writer_output_folder_entry', mw_s, 'output_folder')
+        # --- 新增结束 ---
         # --- 触发一次互斥状态更新 ---
         if hasattr(self, 'video_phone_serial_entry'): self._update_exclusive_entry_state(self.video_phone_serial_entry,
                                                                                          self.video_num_groups_entry)
