@@ -9468,7 +9468,10 @@ class App(ctk.CTk):
         return generated_count
 
     def _video_split_worker(self, video_path, output_folder, duration, use_gpu, crop_roi=None):
-        """【高速流复制版】如果未使用裁剪，则采用流复制模式进行高速分割。"""
+        """
+        【100%精确时长版】
+        通过始终采用重新编码的方式，并使用输出寻址(-ss在-i之后)，确保分割出的每个片段时长绝对精确。
+        """
         generated_count = 0
         try:
             ffmpeg_path = self._find_executable("ffmpeg")
@@ -9498,45 +9501,55 @@ class App(ctk.CTk):
                 output_filename = f"{base_name}_part_{i + 1:03d}.mp4"
                 output_path = os.path.join(output_folder, output_filename)
 
-                self.log_splitter(f"  - 正在导出片段: {i + 1:03d} (从 {start_time:.2f}s 开始，时长 {duration:.2f}s)")
+                self.log_splitter(f"  - 正在精确导出片段: {i + 1:03d} (从 {start_time:.2f}s 开始，时长 {duration:.2f}s)")
 
                 safe_ffmpeg_path = f'"{os.path.normpath(ffmpeg_path)}"'
                 safe_output_path = f'"{os.path.normpath(output_path)}"'
 
-                command_parts = [safe_ffmpeg_path, '-y', '-ss', str(start_time), '-i', safe_input_path, '-t',
-                                 str(duration)]
+                # --- 核心修改点：构建精确的重新编码命令 ---
+                # 1. 将 -ss 参数放在 -i 之后，实现精确跳转
+                command_parts = [
+                    safe_ffmpeg_path, '-y',
+                    '-i', safe_input_path,
+                    '-ss', str(start_time),
+                    '-t', str(duration)
+                ]
 
+                # 2. 如果有裁剪区域，添加-vf滤镜
                 if crop_roi:
-                    # 如果启用了裁剪，必须重新编码，无法使用流复制
-                    self.log_splitter("    -> 检测到预裁剪，将使用重新编码模式（速度较慢）。")
+                    self.log_splitter("    -> 应用预裁剪...")
                     x, y, w, h = crop_roi
-                    video_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
-                    preset = 'fast' if use_gpu else 'medium'
-                    command_parts.extend(
-                        [f'-vf "crop={w}:{h}:{x}:{y}"', '-c:v', video_codec, '-preset', preset, '-c:a', 'aac'])
-                else:
-                    # 如果没有裁剪，使用高速流复制模式
+                    command_parts.extend(['-vf', f'crop={w}:{h}:{x}:{y}'])
 
-                    command_parts.extend(['-c', 'copy'])  # 复制视频和音频流
+                # 3. 始终使用重新编码，不再使用 -c copy
+                video_codec = 'h264_nvenc' if use_gpu and self.is_gpu_available else 'libx264'
+                preset = 'fast' if use_gpu else 'medium'
+                command_parts.extend(['-c:v', video_codec, '-preset', preset])
 
-                command_parts.extend(['-map_metadata', '-1', safe_output_path])
+                # 4. 强制指定像素格式，确保最佳兼容性
+                command_parts.extend(['-pix_fmt', 'yuv420p'])
+
+                # 5. 音频也进行重新编码
+                command_parts.extend(['-c:a', 'aac', '-b:a', '192k'])
+
+                command_parts.append(safe_output_path)
                 command_string = " ".join(command_parts)
+                # --- 修改结束 ---
 
                 try:
                     subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True,
                                    encoding='utf-8', errors='ignore', creationflags=creation_flags)
                     generated_count += 1
                 except subprocess.CalledProcessError as e_inner:
-                    # 流复制模式失败的可能性很小，但为GPU编码失败提供回退
-                    if crop_roi and use_gpu:
+                    # 如果GPU编码失败，则回退到CPU
+                    if use_gpu:
                         self.log_splitter("    -> 警告: GPU编码失败，自动尝试用CPU重试...")
                         command_string = command_string.replace('h264_nvenc', 'libx264').replace('fast', 'medium')
                         subprocess.run(command_string, shell=True, check=True, capture_output=True, text=True,
                                        encoding='utf-8', errors='ignore', creationflags=creation_flags)
                         generated_count += 1
                     else:
-                        # 如果是流复制模式失败或CPU模式失败，则直接抛出
-                        raise e_inner
+                        raise e_inner  # 如果CPU模式都失败了，则抛出异常
 
         except subprocess.CalledProcessError as e:
             self.log_splitter(f"  ❌ FFmpeg 处理失败:\n{e.stderr.strip()}")
